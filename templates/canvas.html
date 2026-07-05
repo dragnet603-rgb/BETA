@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>Canvas - Promptr</title>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='canvas.css') }}"
+    />
+  </head>
+  <body>
+    <div class="promptrText">
+      <a class="link" href="{{ url_for('index') }}"><h1>TelePromptr</h1></a>
+    </div>
+
+    <div id="Export" class="export">
+      <h1>Export</h1>
+    </div>
+
+    <div class="canvas-container">
+      <div class="canvas">
+        <video id="videoPreview" playsinline>
+          <source
+            src="{{ url_for('static', filename='uploads/' + filename) }}"
+            type="video/mp4"
+          />
+
+          Your browser does not support the video tag.
+        </video>
+        <div id="konvaStage"></div>
+
+        <canvas id="videoCanvas"></canvas>
+      </div>
+
+      <div id="cropContainer"></div>
+
+      <!-- Play button -->
+    </div>
+    <button id="topBannerBtn">Add Banner</button>
+    <button id="CropBtn">Crop</button>
+
+    <div id="cropControls">
+      <button id="ratio169">16:9</button>
+      <button id="ratio11">1:1</button>
+
+      <button id="cropApply">Apply</button>
+      <button id="cropCancel">Cancel</button>
+    </div>
+    <button id="playPauseBtn" class="play"></button>
+
+    <!-- Prompt form -->
+
+    <!-- Upload / Download Status -->
+
+    <form id="promptForm" method="POST">
+      <div class="inputWrapper">
+        <input
+          class="promptInput"
+          type="text"
+          name="prompt"
+          placeholder="Type a prompt to edit your video"
+        />
+        <button type="submit" class="uploadBtn" aria-label="Send">
+          <img
+            src="{{ url_for('static', filename='—Pngtree—white upload icon_4561436.png')}}"
+            alt=""
+            aria-hidden="true"
+            class="btnIcon"
+          />
+        </button>
+      </div>
+    </form>
+    <!-- In <head> or just before </body> -->
+    <script src="https://unpkg.com/konva@9/konva.min.js"></script>
+
+    <script src="{{ url_for('static', filename='canvas.js') }}"></script>
+
+    <div id="loader" class="loader hidden">
+      <div class="spinner"></div>
+      <p>Processing...</p>
+    </div>
+
+    <div id="statusBox" class="status-box" style="display: none">
+      <div class="spinner"></div>
+      <p id="statusText">Uploading...</p>
+    </div>
+  </body>
+</html>

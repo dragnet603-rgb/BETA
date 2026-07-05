@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='styles.css') }}"
+    />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0 user-scalable=no"
+    />
+    <title>Promptr</title>
+  </head>
+  <body>
+    <div class="promptrText">
+      <h1>TelePromptr</h1>
+    </div>
+
+    <!-- Add button -->
+    <div id="addP" class="addPage">+</div>
+
+    <div class="tapInstruction">
+      <!-- Hidden file input inside a form -->
+      <form
+        id="uploadForm"
+        action="{{ url_for('upload') }}"
+        method="POST"
+        enctype="multipart/form-data"
+      >
+        <input
+          type="file"
+          id="videoInput"
+          name="video"
+          accept="video/*"
+          style="display: none"
+        />
+      </form>
+      <p>Tap the icon to add a short video</p>
+    </div>
+
+    <!-- Progress Container -->
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+    <!-- Upload Progress -->
+    <div
+      id="uploadProgress"
+      style="
+        display: none;
+        width: 100%;
+        background: #ddd;
+        border-radius: 6px;
+        margin-top: 10px;
+      "
+    >
+      <div
+        id="uploadBar"
+        style="width: 0%; height: 20px; background: #4caf50; border-radius: 6px"
+      ></div>
+    </div>
+    <p
+      id="uploadStatus"
+      style="font-size: 14px; margin-top: 5px; color: #444"
+    ></p>
+
+    <script src="{{ url_for('static', filename='upload.js') }}"></script>
+  </body>
+</html>

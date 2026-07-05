@@ -1,0 +1,1 @@
+add a text to the center that says hello

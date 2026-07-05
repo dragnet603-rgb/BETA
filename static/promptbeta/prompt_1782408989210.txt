@@ -1,0 +1,1 @@
+Inside the banner add a text that says hello

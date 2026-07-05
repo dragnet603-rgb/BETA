@@ -1,0 +1,1 @@
+Crop the video to 16 by 9 then add a text to the center that says girls

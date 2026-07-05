@@ -1,0 +1,1 @@
+Add a text at the center that says hello use a red font

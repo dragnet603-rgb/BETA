@@ -1,0 +1,1 @@
+Add a white banner to the center of the video with a white text : hello

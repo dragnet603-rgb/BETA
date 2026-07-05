@@ -1,0 +1,41 @@
+body {
+  background-color: rgb(34, 32, 32);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-direction: column;
+  height: 100dvh;
+  margin: 0;
+}
+
+.promptrText {
+  position: absolute; /* take it out of flex flow */
+  top: 20px; /* distance from top */
+  left: 20px; /* distance from left */
+  user-select: none;
+}
+
+.vid {
+  border: 1px solid red;
+  display: none;
+}
+
+.promptrText h1 {
+  color: white;
+  font-family: sans-serif;
+  font-size: 35px;
+  margin: 0; /* reset default margins */
+}
+
+.addPage {
+  color: white;
+  font-size: 180px;
+}
+
+.tapInstruction {
+  color: white;
+  font-family: sans-serif;
+  font-size: 20px;
+  position: relative;
+  top: -40px;
+}
