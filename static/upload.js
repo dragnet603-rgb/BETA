@@ -1,49 +1,93 @@
+const MAX_RETRIES = 3;
+
 document.addEventListener("DOMContentLoaded", () => {
   const addBtn = document.getElementById("addP");
-  const fileInput = document.getElementById("videoFile");
-  const uploadForm = document.getElementById("uploadForm");
+  const fileInput = document.getElementById("videoInput");
 
   addBtn.addEventListener("click", () => fileInput.click());
 
-  uploadForm.addEventListener("submit", async (e) => {
-    e.preventDefault();
+  fileInput.addEventListener("change", async () => {
     const file = fileInput.files[0];
-    if (!file) return alert("Please select a file first");
-
-    await uploadFileInChunks(file);
-
-    // Redirect to canvas page
-    window.location.href = `/canvas/${encodeURIComponent(file.name)}`;
+    if (!file) return;
+    try {
+      await uploadFile(file);
+    } catch (err) {
+      alert(`Upload failed: ${err.message}`);
+    }
   });
 });
 
-async function uploadFileInChunks(file) {
-  const chunkSize = 2 * 1024 * 1024; // 2 MB
-  const totalChunks = Math.ceil(file.size / chunkSize);
+function uploadWithProgress(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const fd = new FormData();
+    fd.append("video", file);
 
-  document.getElementById("uploadProgress").style.display = "block";
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    });
 
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * chunkSize;
-    const end = Math.min(file.size, start + chunkSize);
-    const chunk = file.slice(start, end);
+    xhr.addEventListener("load", () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch (e) {
+          reject(new Error("Invalid server response"));
+        }
+      } else {
+        reject(new Error(`Upload failed (${xhr.status})`));
+      }
+    });
 
-    const formData = new FormData();
-    formData.append("chunk", chunk);
-    formData.append("filename", file.name);
-    formData.append("chunk_index", i);
-    formData.append("total_chunks", totalChunks);
+    xhr.addEventListener("error", () =>
+      reject(new Error("Network error during upload")),
+    );
+    xhr.addEventListener("abort", () => reject(new Error("Upload aborted")));
 
-    await fetch("/upload-chunk", { method: "POST", body: formData });
+    xhr.open("POST", "/upload");
+    xhr.send(fd);
+  });
+}
 
-    // Update bar
-    let percent = Math.round(((i + 1) / totalChunks) * 100);
-    document.getElementById("uploadBar").style.width = percent + "%";
-    document.getElementById(
-      "uploadStatus"
-    ).innerText = `Uploading... ${percent}%`;
+async function uploadFile(file) {
+  const overlay = document.getElementById("uploadOverlay");
+  const bar = document.getElementById("progressBar");
+  const pct = document.getElementById("uploadPercent");
+  const label = document.getElementById("uploadLabel");
+
+  if (overlay) overlay.style.display = "flex";
+  if (label) label.textContent = "Uploading…";
+
+  const updateProgress = (percent) => {
+    if (bar) bar.style.width = `${percent}%`;
+    if (pct) pct.textContent = `${percent}%`;
+  };
+
+  let lastError;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const data = await uploadWithProgress(file, updateProgress);
+      if (!data.filename) throw new Error("No filename returned");
+
+      if (label) label.textContent = "Processing…";
+      updateProgress(100);
+      await new Promise((r) => setTimeout(r, 300));
+
+      window.location.href = `/canvas/${data.filename}`;
+      return;
+    } catch (err) {
+      lastError = err;
+      console.warn(`Upload attempt ${attempt + 1} failed:`, err);
+      if (attempt < MAX_RETRIES - 1) {
+        if (label)
+          label.textContent = `Retrying (${attempt + 2}/${MAX_RETRIES})…`;
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
   }
 
-  document.getElementById("uploadStatus").innerText = "Finalizing upload...";
-  await fetch(`/merge-chunks?filename=${encodeURIComponent(file.name)}`);
+  if (overlay) overlay.style.display = "none";
+  throw lastError;
 }

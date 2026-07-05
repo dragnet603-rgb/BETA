@@ -10,15 +10,15 @@ app = Flask(__name__)
 
 UPLOAD_FOLDER = "static/uploads"
 OUTPUT_FOLDER = "static/outputs"
-CHUNKS_FOLDER = "static/chunks"
 PROMPTS_FOLDER = "static/promptbeta"
 
-for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER, CHUNKS_FOLDER, PROMPTS_FOLDER]:
+for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER, PROMPTS_FOLDER]:
     os.makedirs(folder, exist_ok=True)
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["OUTPUT_FOLDER"] = OUTPUT_FOLDER
 app.config["PROMPTS_FOLDER"] = PROMPTS_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB cap, adjust as needed
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -41,78 +41,13 @@ def allowed_file(filename):
 def upload():
     file = request.files.get("video")
     if not file or file.filename == "" or not allowed_file(file.filename):
-        return "Invalid file type", 400
+        return jsonify({"error": "Invalid file type"}), 400
+
     filename = secure_filename(file.filename)
     filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
     file.save(filepath)
-    return redirect(url_for("canvas_page", filename=filename))
 
-import threading
-import shutil
-
-ASSEMBLE_BUF = 8 * 1024 * 1024
-
-_chunk_counters = {}
-_chunk_locks    = {}
-_chunk_meta     = {}
-
-def _get_lock(safe_name):
-    if safe_name not in _chunk_locks:
-        _chunk_locks[safe_name] = threading.Lock()
-    return _chunk_locks[safe_name]
-
-def _cleanup_chunks(chunk_dir, safe_name):
-    try:
-        shutil.rmtree(chunk_dir, ignore_errors=True)
-    finally:
-        lock = _get_lock(safe_name)
-        with lock:
-            _chunk_counters.pop(safe_name, None)
-            _chunk_meta.pop(safe_name, None)
-        _chunk_locks.pop(safe_name, None)
-
-@app.route("/upload-chunk", methods=["POST"])
-def upload_chunk():
-    chunk = request.files.get("chunk")
-    filename = request.form.get("filename")
-    chunk_index = int(request.form.get("chunkIndex", 0))
-    total_chunks = int(request.form.get("totalChunks", 1))
-
-    if not chunk or not filename:
-        return jsonify({"error": "Missing chunk or filename"}), 400
-
-    safe_name = secure_filename(filename)
-    chunk_dir = os.path.join(CHUNKS_FOLDER, safe_name)
-    os.makedirs(chunk_dir, exist_ok=True)
-    chunk.save(os.path.join(chunk_dir, f"chunk_{chunk_index:05d}"))
-
-    # --- O(1) counter instead of os.listdir() ---
-    lock = _get_lock(safe_name)
-    with lock:
-        _chunk_meta.setdefault(safe_name, total_chunks)
-        _chunk_counters[safe_name] = _chunk_counters.get(safe_name, 0) + 1
-        received = _chunk_counters[safe_name]
-
-    if received == total_chunks:
-        output_path = os.path.join(UPLOAD_FOLDER, safe_name)
-
-        # --- Streamed assembly, 8 MB buffer, no full-file memory load ---
-        with open(output_path, "wb", buffering=ASSEMBLE_BUF) as out:
-            for i in range(total_chunks):
-                chunk_path = os.path.join(chunk_dir, f"chunk_{i:05d}")
-                with open(chunk_path, "rb") as part:
-                    shutil.copyfileobj(part, out, length=ASSEMBLE_BUF)
-
-        # --- Cleanup in background so response returns immediately ---
-        threading.Thread(
-            target=_cleanup_chunks,
-            args=(chunk_dir, safe_name),
-            daemon=True
-        ).start()
-
-        return jsonify({"status": "complete", "filename": safe_name})
-
-    return jsonify({"status": "chunk_received", "received": received, "total": total_chunks})
+    return jsonify({"status": "complete", "filename": filename})
 
 
 @app.route("/canvas/<filename>")
@@ -211,6 +146,37 @@ Examples:
     return jsonify(parsed)
 
 
+def wrap_text_to_lines(text, max_chars):
+    """
+    Greedy word-wrap: builds lines up to ~max_chars wide.
+    This is what makes drawtext actually break long captions into
+    multiple lines instead of rendering one long overflowing line —
+    ffmpeg's drawtext filter never wraps text on its own; you have to
+    hand it literal '\\n' characters between lines.
+    """
+    if not text:
+        return [""]
+
+    lines = []
+    for paragraph in text.split("\n"):
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if current and len(candidate) > max_chars:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+
+    return lines or [""]
+
+
 @app.route("/edit-video/<filename>", methods=["POST"])
 def edit_video(filename):
     edits = request.json.get("edits", [])
@@ -223,20 +189,46 @@ def edit_video(filename):
     if not os.path.exists(input_path):
         return jsonify({"error": "Input file not found"}), 404
 
-    # Get video dimensions
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", input_path],
-        capture_output=True, text=True
-    )
-    probe_out = probe.stdout.strip()
-    if not probe_out:
-        return jsonify({"error": "Could not probe video dimensions"}), 500
-    w, h = map(int, probe_out.split("x"))
+    # Get video dimensions.
+    # Mobile-recorded files sometimes report an odd stream layout (extra
+    # thumbnail/cover-art track, ambiguous "v:0" index, or a blank field on
+    # one line) that a naive single split("x") can't handle. probe_dims()
+    # scans every returned line for the first clean "WIDTHxHEIGHT" pair, and
+    # if pinning to stream v:0 comes back empty we retry against "v" (any
+    # video stream) before giving up.
+    def probe_dims(select_streams):
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", select_streams,
+             "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", input_path],
+            capture_output=True, text=True
+        )
+        found = None
+        for line in p.stdout.strip().splitlines():
+            parts = line.strip().split("x")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                found = (int(parts[0]), int(parts[1]))
+                break
+        return found, p
+
+    dims, probe = probe_dims("v:0")
+    if dims is None:
+        dims, probe = probe_dims("v")
+
+    if dims is None:
+        print("ffprobe stdout:", repr(probe.stdout))
+        print("ffprobe stderr:", repr(probe.stderr))
+        return jsonify({
+            "error": "Could not determine video dimensions",
+            "ffprobe_stdout": probe.stdout,
+            "ffprobe_stderr": probe.stderr
+        }), 500
+
+    w, h = dims
     print(f"Video dimensions: {w}x{h}")
 
-    # Font detection
+    # Font detection — bundled font first, OS fonts as fallback only
     font_candidates = [
+        os.path.join(app.root_path, "static/fonts/Poppins-Bold.ttf"),
         "C:/Windows/Fonts/impact.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
         "C:/Windows/Fonts/arial.ttf",
@@ -246,7 +238,6 @@ def edit_video(filename):
     ]
     fontfile = next((f for f in font_candidates if os.path.exists(f)), None)
     safe_font = fontfile.replace("\\", "/").replace(":", "\\:") if fontfile else None
-
     color_map = {
         "white": "ffffff", "black": "000000", "red": "ff0000",
         "blue": "0000ff", "green": "00ff00", "yellow": "ffff00",
@@ -302,17 +293,15 @@ def edit_video(filename):
         elif t == "top_banner":
             fsize   = int(item.get("font_size", 28) * (w / 720))
             padding = item.get("padding", 20)
-            # Estimate banner height: font_size * 1.5 per line + 2*padding
-            # We'll use ffmpeg to draw it, so we need to know height upfront.
-            # Approximate: assume text wraps at ~40 chars per line for 720-wide
             text    = item.get("text", "")
             chars_per_line = max(20, int(w / (fsize * 0.6)))
-            lines   = max(1, -(-len(text) // chars_per_line))  # ceiling div
-            banner_h = int(lines * fsize * 1.4 + padding * 2)
+            lines   = wrap_text_to_lines(text, chars_per_line)
+            banner_h = int(len(lines) * fsize * 1.4 + padding * 2)
             banner_h = max(banner_h, fsize + padding * 2)
             pad_top += banner_h
             top_banners.append({
                 "text": text,
+                "lines": lines,
                 "fsize": fsize,
                 "padding": padding,
                 "banner_h": banner_h,
@@ -326,11 +315,12 @@ def edit_video(filename):
             padding = item.get("padding", 16)
             text    = item.get("text", "")
             chars_per_line = max(20, int(w / (fsize * 0.6)))
-            lines   = max(1, -(-len(text) // chars_per_line))
-            banner_h = int(lines * fsize * 1.4 + padding * 2)
+            lines   = wrap_text_to_lines(text, chars_per_line)
+            banner_h = int(len(lines) * fsize * 1.4 + padding * 2)
             banner_h = max(banner_h, fsize + padding * 2)
             bottom_banners.append({
                 "text": text,
+                "lines": lines,
                 "fsize": fsize,
                 "padding": padding,
                 "banner_h": banner_h,
@@ -347,13 +337,15 @@ def edit_video(filename):
     eff_w = crop_w if crop_filter else w
     eff_h = crop_h if crop_filter else h
 
-    # Re-scale banner font sizes to cropped width
+    # Re-scale banner font sizes to cropped width, and re-wrap text at the
+    # new width (line breaks depend on how many chars fit per line, which
+    # changes once the width changes).
     for b in top_banners:
         b["fsize"] = max(10, int(b["fsize"] * eff_w / max(w, 1)))
         chars_per_line = max(10, int(eff_w / (b["fsize"] * 0.6)))
-        lines = max(1, -(-len(b["text"]) // chars_per_line))
+        b["lines"] = wrap_text_to_lines(b["text"], chars_per_line)
         b["banner_h"] = max(b["fsize"] + b["padding"] * 2,
-                            int(lines * b["fsize"] * 1.4 + b["padding"] * 2))
+                            int(len(b["lines"]) * b["fsize"] * 1.4 + b["padding"] * 2))
     # Recalculate pad_top with updated banner heights
     pad_top = 0
     for b in top_banners:
@@ -364,9 +356,9 @@ def edit_video(filename):
     for b in bottom_banners:
         b["fsize"] = max(10, int(b["fsize"] * eff_w / max(w, 1)))
         chars_per_line = max(10, int(eff_w / (b["fsize"] * 0.6)))
-        lines = max(1, -(-len(b["text"]) // chars_per_line))
+        b["lines"] = wrap_text_to_lines(b["text"], chars_per_line)
         b["banner_h"] = max(b["fsize"] + b["padding"] * 2,
-                            int(lines * b["fsize"] * 1.4 + b["padding"] * 2))
+                            int(len(b["lines"]) * b["fsize"] * 1.4 + b["padding"] * 2))
         b["y_offset"] = pad_bottom
         pad_bottom += b["banner_h"]
 
@@ -405,9 +397,11 @@ def edit_video(filename):
     h_pad = max(16, int(out_w * 0.04))  # 4% of width, min 16px
 
     if safe_font:
-        # 5. Top banner text — centered, with horizontal padding
+        # 5. Top banner text — centered, with horizontal padding.
+        # Join the wrapped lines with a literal '\n' so drawtext actually
+        # renders multiple lines instead of one long overflowing line.
         for b in top_banners:
-            txt    = sanitize(b["text"])
+            txt    = "\n".join(sanitize(line) for line in b["lines"])
             text_y = b["y_offset"] + b["banner_h"] // 2
             max_w  = out_w - h_pad * 2
             vf_parts.append(
@@ -420,7 +414,7 @@ def edit_video(filename):
 
         # 6. Bottom banner text
         for b in bottom_banners:
-            txt = sanitize(b["text"])
+            txt = "\n".join(sanitize(line) for line in b["lines"])
             y   = pad_top + eff_h + b["y_offset"] + b["banner_h"] // 2
             vf_parts.append(
                 f"drawtext=text='{txt}':fontfile='{safe_font}'"
@@ -430,12 +424,15 @@ def edit_video(filename):
                 f":line_spacing=6"
             )
 
-        # 7. Overlay texts on video area
+        # 7. Overlay texts on video area (also wrapped, using the video's
+        # visible width as the wrap boundary)
         for item in overlay_texts:
-            txt   = sanitize(item.get("text", ""))
             fsize = max(10, int(item.get("font_size", 28) * (eff_w / 720)))
             fg    = hex_color(item.get("text_color", "white"))
             pos   = item.get("position", "bottom")
+            chars_per_line = max(10, int((eff_w - h_pad * 2) / (fsize * 0.6)))
+            lines = wrap_text_to_lines(item.get("text", ""), chars_per_line)
+            txt   = "\n".join(sanitize(line) for line in lines)
             if pos == "top":
                 y_expr = f"{pad_top + 20}"
             elif pos == "center":
@@ -446,6 +443,7 @@ def edit_video(filename):
                 f"drawtext=text='{txt}':fontfile='{safe_font}'"
                 f":fontsize={fsize}:fontcolor={fg}"
                 f":x=(w-text_w)/2:y={y_expr}"
+                f":line_spacing=6"
             )
 
     cmd = ["ffmpeg", "-y", "-i", input_path,
@@ -474,4 +472,4 @@ print("OPENROUTER_API_KEY exists:", bool(os.getenv("OPENROUTER_API_KEY")))
 
 if __name__ == "__main__":
     print("Server running...")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)

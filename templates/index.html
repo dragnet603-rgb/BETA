@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -14,14 +14,12 @@
   </head>
   <body>
     <div class="promptrText">
-      <h1>TelePromptr</h1>
+      <h1>Promptr</h1>
     </div>
 
-    <!-- Add button -->
     <div id="addP" class="addPage">+</div>
 
     <div class="tapInstruction">
-      <!-- Hidden file input inside a form -->
       <form
         id="uploadForm"
         action="{{ url_for('upload') }}"
@@ -39,30 +37,20 @@
       <p>Tap the icon to add a short video</p>
     </div>
 
-    <!-- Progress Container -->
-
-    <script src="{{ url_for('static', filename='script.js') }}"></script>
-    <!-- Upload Progress -->
-    <div
-      id="uploadProgress"
-      style="
-        display: none;
-        width: 100%;
-        background: #ddd;
-        border-radius: 6px;
-        margin-top: 10px;
-      "
-    >
-      <div
-        id="uploadBar"
-        style="width: 0%; height: 20px; background: #4caf50; border-radius: 6px"
-      ></div>
+    <!-- Upload overlay -->
+    <div id="uploadOverlay" style="display: none">
+      <div id="uploadCard">
+        <div id="spinnerRing"></div>
+        <p id="uploadLabel">Uploading video…</p>
+        <div id="progressTrack">
+          <div id="progressBar"></div>
+        </div>
+        <p id="uploadPercent">0%</p>
+      </div>
     </div>
-    <p
-      id="uploadStatus"
-      style="font-size: 14px; margin-top: 5px; color: #444"
-    ></p>
 
+    <!-- Scripts go LAST so they can find the overlay div above -->
+    <!-- <script src="{{ url_for('static', filename='script.js') }}"></script> -->
     <script src="{{ url_for('static', filename='upload.js') }}"></script>
   </body>
 </html>

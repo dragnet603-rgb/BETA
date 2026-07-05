@@ -9,9 +9,26 @@ document.addEventListener("DOMContentLoaded", () => {
   const videoFileInput = document.getElementById("videoFile");
   const playPauseBtn = document.getElementById("playPauseBtn");
   const konvaContainer = document.getElementById("konvaStage");
+  const topBannerBtn = document.getElementById("topBannerBtn");
   konvaContainer.style.display = "none";
 
   if (!video || !container) return;
+  
+function showEditingOverlay() {
+  const overlay = document.getElementById("editOverlay");
+  if (!overlay) return;
+  container.classList.add("processing");
+  overlay.classList.add("active");
+}
+
+function hideEditingOverlay() {
+  const overlay = document.getElementById("editOverlay");
+  container.classList.remove("processing");
+  overlay?.classList.remove("active");
+}
+
+  // Banner should be addable any time — cropped or not. It no longer waits
+  // for a crop to be applied before showing/working.
 
   const stage = new Konva.Stage({
     container: "konvaStage",
@@ -73,6 +90,11 @@ document.addEventListener("DOMContentLoaded", () => {
   layer.add(overlay);
   overlay.moveToBottom();
 
+  // Crop UI (rectangle/handle/overlay, and later the post-apply resize box)
+  // all live on `layer`. Keep it hidden until crop mode is actually entered
+  // so it doesn't flash into view just because the banner turned the stage on.
+  layer.visible(false);
+
   function redrawCropUI() {
     layer.batchDraw();
   }
@@ -114,6 +136,10 @@ document.addEventListener("DOMContentLoaded", () => {
     };
   }
 
+  // Returns the box the <video> element occupies in the container (its CSS
+  // box), NOT the actual rendered video pixels. Use getIntrinsicVideoRect()
+  // below when you need the real visible video content (handles
+  // letterboxing/pillarboxing for any aspect ratio — 16:9, 1:1, 4:3, 9:16…).
   function getVideoBoundsOnCanvas() {
     const vr = video.getBoundingClientRect();
     const cr = container.getBoundingClientRect();
@@ -125,29 +151,45 @@ document.addEventListener("DOMContentLoaded", () => {
     };
   }
 
-  // Returns the correct vb for banner positioning:
-  // - if cropDisplayRect is set, use it
-  // - else if a crop edit exists, the cropped video fills the full container
-  // - else fall back to the raw video bounds
-  function getCropDisplayVb() {
-    if (cropDisplayRect) {
-      return {
-        x: cropDisplayRect.left,
-        y: cropDisplayRect.top,
-        w: cropDisplayRect.w,
-        h: cropDisplayRect.h,
-      };
+  // The <video> element's CSS box and the actual visible video frame are
+  // only the same when the element's aspect ratio matches the video's
+  // intrinsic aspect ratio. With object-fit: contain (the default we rely
+  // on), any mismatch — a 1:1 or 4:3 clip inside a 16:9-shaped box, etc. —
+  // produces letterboxing/pillarboxing. This computes the real content
+  // rect so banners/crop UI snap to the footage itself, not the empty bars.
+  function getIntrinsicVideoRect() {
+    const vr = video.getBoundingClientRect();
+    const cr = container.getBoundingClientRect();
+    const boxLeft = vr.left - cr.left;
+    const boxTop = vr.top - cr.top;
+    const boxW = vr.width;
+    const boxH = vr.height;
+
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh || !boxW || !boxH) {
+      return { x: boxLeft, y: boxTop, w: boxW, h: boxH };
     }
-    const cropEdit = edits.find((e) => e.type === "crop");
-    if (cropEdit) {
-      return {
-        x: 0,
-        y: 0,
-        w: container.clientWidth,
-        h: container.clientHeight,
-      };
+
+    const videoRatio = vw / vh;
+    const boxRatio = boxW / boxH;
+
+    let w, h, x, y;
+    if (videoRatio > boxRatio) {
+      // Video is relatively wider than the box → letterboxed top/bottom
+      w = boxW;
+      h = boxW / videoRatio;
+      x = boxLeft;
+      y = boxTop + (boxH - h) / 2;
+    } else {
+      // Video is relatively taller/narrower than the box → pillarboxed sides
+      h = boxH;
+      w = boxH * videoRatio;
+      x = boxLeft + (boxW - w) / 2;
+      y = boxTop;
     }
-    return getVideoBoundsOnCanvas();
+
+    return { x, y, w, h };
   }
 
   function getCropData() {
@@ -179,9 +221,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
     cropApplied = true;
 
-    const bannerBtn = document.getElementById("topBannerBtn");
-    if (bannerBtn) bannerBtn.style.display = "inline-block";
-
     updateCanvas();
   });
 
@@ -193,6 +232,8 @@ document.addEventListener("DOMContentLoaded", () => {
       );
       if (!hasBanners) konvaContainer.style.display = "none";
       document.getElementById("cropControls").style.display = "none";
+      const hasCrop = edits.some((e) => e.type === "crop");
+      if (!hasCrop) layer.visible(false);
     });
   }
 
@@ -276,39 +317,171 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  if (form) {
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const btn = document.querySelector(".uploadBtn");
-      if (btn) {
-        btn.classList.add("loading");
-        btn.disabled = true;
-      }
-      try {
-        const promptInput = form.querySelector("input");
-        if (!promptInput) return;
-        const prompt = promptInput.value.trim();
-        if (!prompt) return;
-        const res = await fetch(`/edit-json/${getFilename()}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({ prompt }),
-        });
-        if (!res.ok) throw new Error(`Server error ${res.status}`);
-        const newEdits = await res.json();
-        if (!Array.isArray(newEdits))
-          throw new Error("Invalid server response");
-      } catch (err) {
-        console.error("Prompt error:", err);
-        alert(`Error: ${err.message}`);
-      } finally {
-        if (btn) {
-          btn.classList.remove("loading");
-          btn.disabled = false;
-        }
-      }
-    });
+  // ── AI prompt → edits bridge ────────────────────────────────────────────
+  // /edit-json returns an array of {type, ...} items shaped by the LLM
+  // system prompt (top_banner, bottom_banner, overlay_text, crop). This is
+  // what actually turns that JSON into real Konva banners / crop / overlay
+  // state instead of letting it sit unused after the fetch resolves.
+
+  function aspectRatioToNumber(str) {
+    if (!str || typeof str !== "string" || !str.includes(":")) return null;
+    const [a, b] = str.split(":").map(Number);
+    if (!a || !b) return null;
+    return a / b;
   }
+
+  // Converts an aspect_ratio string ("9:16", "1:1", etc) into the same
+  // normalized nx/ny/nw/nh format the drag-crop UI produces via
+  // getCropData(), centered on the source video. This keeps the AI crop
+  // path compatible with /edit-video's freeform crop handler, which only
+  // understands nx/ny/nw/nh — not aspect_ratio.
+  function applyCropFromAI(aspectRatioStr) {
+    const ratio = aspectRatioToNumber(aspectRatioStr);
+    if (!ratio) {
+      console.warn(
+        "Could not parse aspect ratio from AI response:",
+        aspectRatioStr,
+      );
+      return;
+    }
+    if (!video.videoWidth || !video.videoHeight) {
+      video.addEventListener(
+        "loadedmetadata",
+        () => applyCropFromAI(aspectRatioStr),
+        { once: true },
+      );
+      return;
+    }
+
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    let cropW, cropH;
+    if (vw / vh > ratio) {
+      cropH = vh;
+      cropW = vh * ratio;
+    } else {
+      cropW = vw;
+      cropH = vw / ratio;
+    }
+
+    const nx = (vw - cropW) / 2 / vw;
+    const ny = (vh - cropH) / 2 / vh;
+    const nw = cropW / vw;
+    const nh = cropH / vh;
+
+    edits = edits.filter((e) => e.type !== "crop");
+    edits.unshift({ type: "crop", nx, ny, nw, nh });
+
+    konvaContainer.style.display = "block";
+    stage.width(container.clientWidth);
+    stage.height(container.clientHeight);
+    showCroppedPreview({ nx, ny, nw, nh });
+  }
+
+  // Dispatches every item the AI returned to the right handler. Crop is
+  // applied first since banner snapping (getVisibleVideoRect) depends on
+  // cropDisplayRect already being set.
+  function applyAIEdits(newEdits) {
+    console.log("[applyAIEdits] received from /edit-json:", newEdits);
+
+    if (!Array.isArray(newEdits) || !newEdits.length) {
+      console.warn(
+        "[applyAIEdits] empty or non-array response, nothing to apply",
+      );
+      return;
+    }
+
+    const cropItem = newEdits.find((e) => e.type === "crop");
+    const bannerItems = newEdits.filter(
+      (e) => e.type === "top_banner" || e.type === "bottom_banner",
+    );
+    const overlayItems = newEdits.filter((e) => e.type === "overlay_text");
+    const unrecognized = newEdits.filter(
+      (e) =>
+        e.type !== "crop" &&
+        e.type !== "top_banner" &&
+        e.type !== "bottom_banner" &&
+        e.type !== "overlay_text",
+    );
+    if (unrecognized.length) {
+      console.warn(
+        "[applyAIEdits] unrecognized item types, ignored:",
+        unrecognized,
+      );
+    }
+
+    if (cropItem) {
+      console.log("[applyAIEdits] applying crop:", cropItem);
+      applyCropFromAI(cropItem.aspect_ratio);
+    }
+
+    bannerItems.forEach((item) => {
+      console.log("[applyAIEdits] applying banner:", item);
+      const group = addBanner({
+        position: item.type === "bottom_banner" ? "bottom" : "top",
+        text: item.text || "",
+        bg_color:
+          item.bg_color ||
+          (item.type === "bottom_banner" ? "#000000" : "#ffffff"),
+        text_color:
+          item.text_color ||
+          (item.type === "bottom_banner" ? "#ffffff" : "#000000"),
+        font_size: item.font_size || 22,
+      });
+      console.log(
+        "[applyAIEdits] banner group created:",
+        group,
+        "visible:",
+        konvaContainer.style.display,
+      );
+    });
+
+    if (overlayItems.length) {
+      console.log("[applyAIEdits] applying overlay text:", overlayItems);
+      overlayItems.forEach((item) => edits.push(item));
+      updateCanvas();
+    }
+  }
+
+  if (form) {
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = document.querySelector(".uploadBtn");
+    if (btn) {
+      btn.classList.add("loading");
+      btn.disabled = true;
+    }
+    try {
+      const promptInput = form.querySelector("input");
+      if (!promptInput) return;
+      const prompt = promptInput.value.trim();
+      if (!prompt) return;
+
+      showEditingOverlay(); // <-- added
+
+      const res = await fetch(`/edit-json/${getFilename()}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ prompt }),
+      });
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      const newEdits = await res.json();
+      if (!Array.isArray(newEdits)) throw new Error("Invalid server response");
+
+      applyAIEdits(newEdits);
+      promptInput.value = "";
+    } catch (err) {
+      console.error("Prompt error:", err);
+      alert(`Error: ${err.message}`);
+    } finally {
+      hideEditingOverlay(); // <-- added
+      if (btn) {
+        btn.classList.remove("loading");
+        btn.disabled = false;
+      }
+    }
+  });
+}
 
   function renderOverlays(vb) {
     const scale = vb.w / 720;
@@ -379,6 +552,7 @@ document.addEventListener("DOMContentLoaded", () => {
     konvaContainer.style.display = "block";
     stage.width(cw);
     stage.height(ch);
+    layer.visible(true);
     layer.destroyChildren();
     if (bannerLayer) bannerLayer.moveToTop();
 
@@ -563,8 +737,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // ── Banner system ─────────────────────────────────────────────────────────
-  document.getElementById("topBannerBtn")?.addEventListener("click", () => {
-    if (!cropApplied) return;
+  topBannerBtn?.addEventListener("click", () => {
     konvaContainer.style.display = "block";
     stage.width(container.clientWidth);
     stage.height(container.clientHeight);
@@ -578,7 +751,7 @@ document.addEventListener("DOMContentLoaded", () => {
     stage.width(container.clientWidth);
     stage.height(container.clientHeight);
 
-    const vb = getCropDisplayVb();
+    const vb = getVisibleVideoRect();
     const bannerH = options.height || 60;
     const text = options.text || "Your text here";
     const bgColor = options.bg_color || "#ffffff";
@@ -588,7 +761,9 @@ document.addEventListener("DOMContentLoaded", () => {
     let isAttached = true;
     const attachSide = options.position === "bottom" ? "bottom" : "top";
 
-    function getAttachedPosition(vb) {
+    function getAttachedPosition() {
+      const vb = getVisibleVideoRect();
+
       return {
         x: vb.x,
         y: attachSide === "bottom" ? vb.y + vb.h : vb.y - bannerH,
@@ -760,7 +935,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     function snapToVideo() {
-      const vb = getCropDisplayVb();
+      const vb = getVisibleVideoRect();
       const pos = getAttachedPosition(vb);
       group.x(pos.x);
       group.y(pos.y);
@@ -822,6 +997,7 @@ document.addEventListener("DOMContentLoaded", () => {
         showCroppedPreview(cropEdit);
       } else {
         container.style.background = "";
+        layer.visible(false);
       }
 
       const hasBanners = edits.some(
@@ -850,20 +1026,58 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  let exportFakeInterval = null;
+  let exportDisplayPercent = 0;
+
+  function startExportFakeProgress(bar, pct) {
+    exportDisplayPercent = 0;
+    exportFakeInterval = setInterval(() => {
+      const target = Math.min(
+        95,
+        exportDisplayPercent +
+          (exportDisplayPercent < 60
+            ? 3
+            : exportDisplayPercent < 85
+              ? 1.2
+              : 0.3),
+      );
+      if (exportDisplayPercent < target) {
+        exportDisplayPercent = Math.min(target, exportDisplayPercent + 1);
+        if (bar) bar.style.width = `${exportDisplayPercent}%`;
+        if (pct) pct.textContent = `${Math.round(exportDisplayPercent)}%`;
+      }
+    }, 80);
+  }
+
+  function stopExportFakeProgress() {
+    clearInterval(exportFakeInterval);
+    exportFakeInterval = null;
+  }
+
   if (expBtn) {
     expBtn.addEventListener("click", async () => {
       if (!edits.length) {
         alert("No edits to export.");
         return;
       }
+
+      const overlay = document.getElementById("exportOverlay");
+      const bar = document.getElementById("exportProgressBar");
+      const pct = document.getElementById("exportPercent");
+      const label = document.getElementById("exportLabel");
+
+      if (overlay) overlay.style.display = "flex";
+      if (label) label.textContent = "Exporting…";
+      startExportFakeProgress(bar, pct);
+
       try {
-        showStatus("Exporting video…");
         const exportEdits = edits.map(({ _bannerGroup, ...rest }) => rest);
         const res = await fetch(`/edit-video/${getFilename()}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ edits: exportEdits }),
         });
+
         if (!res.ok) {
           let detail = res.statusText;
           try {
@@ -872,21 +1086,31 @@ document.addEventListener("DOMContentLoaded", () => {
           } catch (_) {}
           throw new Error(`Server error ${res.status}: ${detail}`);
         }
+
         const data = await res.json();
         if (!data.output_file)
           throw new Error("No output file returned from server");
-        showStatus("Download starting…");
+
+        stopExportFakeProgress();
+        if (bar) bar.style.width = "100%";
+        if (pct) pct.textContent = "100%";
+        if (label) label.textContent = "Download starting…";
+
+        await new Promise((r) => setTimeout(r, 500));
+
         const a = document.createElement("a");
         a.href = `/download/${data.output_file}`;
         a.download = data.output_file;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        setTimeout(hideStatus, 4000);
+
+        if (overlay) overlay.style.display = "none";
       } catch (err) {
         console.error(err);
+        stopExportFakeProgress();
+        if (overlay) overlay.style.display = "none";
         alert(`Export failed: ${err.message}`);
-        hideStatus();
       }
     });
   }
@@ -898,8 +1122,27 @@ document.addEventListener("DOMContentLoaded", () => {
       stage.height(container.clientHeight);
       konvaContainer.style.display = "block";
       document.getElementById("cropControls").style.display = "block";
+      layer.visible(true);
       showCropBox(16 / 9);
     });
+  }
+
+  function getVisibleVideoRect() {
+    // Cropped preview — already an exact rect, no letterboxing to account for.
+    if (cropDisplayRect) {
+      return {
+        x: cropDisplayRect.left,
+        y: cropDisplayRect.top,
+        w: cropDisplayRect.w,
+        h: cropDisplayRect.h,
+      };
+    }
+
+    // No crop yet: use the real visible video content rect, not the
+    // <video> element's outer box. This is what makes top-banner snapping
+    // work correctly for any source aspect ratio (16:9, 1:1, 4:3, 9:16…)
+    // instead of only looking right when the video happens to fill its box.
+    return getIntrinsicVideoRect();
   }
 
   const CHUNK_SIZE = 8 * 1024 * 1024;
@@ -907,6 +1150,14 @@ document.addEventListener("DOMContentLoaded", () => {
   async function uploadFileInChunks(file) {
     const total = Math.ceil(file.size / CHUNK_SIZE);
     const statusEl = document.getElementById("uploadStatus");
+
+    // --- Show overlay ---
+    const overlay = document.getElementById("uploadOverlay");
+    const bar = document.getElementById("progressBar");
+    const pct = document.getElementById("uploadPercent");
+    const label = document.getElementById("uploadLabel");
+    if (overlay) overlay.style.display = "flex";
+
     let completed = 0;
     let finalFilename = null;
 
@@ -923,8 +1174,13 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!res.ok) throw new Error(`Chunk ${i} upload failed (${res.status})`);
       const data = await res.json();
       completed++;
-      if (statusEl)
-        statusEl.innerText = `Uploading… ${Math.round((completed / total) * 100)}%`;
+
+      // --- Update overlay ---
+      const percent = Math.round((completed / total) * 100);
+      if (bar) bar.style.width = `${percent}%`;
+      if (pct) pct.textContent = `${percent}%`;
+      if (statusEl) statusEl.innerText = `Uploading… ${percent}%`;
+
       if (data.status === "complete") finalFilename = data.filename;
     }
 
@@ -936,30 +1192,22 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
 
-    await Promise.all(
-      Array.from({ length: Math.min(MAX_PARALLEL, total) }, () => worker()),
-    );
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(MAX_PARALLEL, total) }, () => worker()),
+      );
+      if (!finalFilename)
+        throw new Error("Server returned no filename after upload");
 
-    if (!finalFilename)
-      throw new Error("Server returned no filename after upload");
-    window.location.href = `/canvas/${finalFilename}`;
-  }
-  if (uploadForm) {
-    uploadForm.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const file = videoFileInput && videoFileInput.files[0];
-      const statusEl = document.getElementById("uploadStatus");
-      if (!file) {
-        alert("Please select a file");
-        return;
-      }
-      try {
-        await uploadFileInChunks(file);
-        if (statusEl) statusEl.innerText = "Upload complete!";
-      } catch (err) {
-        if (statusEl) statusEl.innerText = `Upload failed: ${err.message}`;
-        console.error("Upload error:", err);
-      }
-    });
+      // --- Swap spinner for checkmark before redirect ---
+      if (label) label.textContent = "Processing…";
+      if (bar) bar.style.width = "100%";
+      if (pct) pct.textContent = "100%";
+
+      window.location.href = `/canvas/${finalFilename}`;
+    } catch (err) {
+      if (overlay) overlay.style.display = "none";
+      throw err; // lets the existing error handler in uploadForm show the message
+    }
   }
 });

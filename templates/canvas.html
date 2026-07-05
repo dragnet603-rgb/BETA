@@ -14,7 +14,7 @@
   </head>
   <body>
     <div class="promptrText">
-      <a class="link" href="{{ url_for('index') }}"><h1>TelePromptr</h1></a>
+      <a class="link" href="{{ url_for('index') }}"><h1>Promptr</h1></a>
     </div>
 
     <div id="Export" class="export">
@@ -31,6 +31,13 @@
 
           Your browser does not support the video tag.
         </video>
+        <div id="editOverlay" class="edit-overlay">
+  <div class="edit-overlay-content">
+    <p id="editOverlayText">Editing video…</p>
+    <div class="bounce-track"><div class="bounce-ball"></div></div>
+    
+  </div>
+</div>
         <div id="konvaStage"></div>
 
         <canvas id="videoCanvas"></canvas>
@@ -40,15 +47,15 @@
 
       <!-- Play button -->
     </div>
-    <button id="topBannerBtn">Add Banner</button>
-    <button id="CropBtn">Crop</button>
+    <button id="topBannerBtn" style="display: none">Add Banner</button>
+    <button id="CropBtn" style="display: none">Crop</button>
 
     <div id="cropControls">
-      <button id="ratio169">16:9</button>
-      <button id="ratio11">1:1</button>
+      <button id="ratio169" style="display: none">16:9</button>
+      <button id="ratio11" style="display: none">1:1</button>
 
-      <button id="cropApply">Apply</button>
-      <button id="cropCancel">Cancel</button>
+      <button id="cropApply" style="display: none">Apply</button>
+      <button id="cropCancel" style="display: none">Cancel</button>
     </div>
     <button id="playPauseBtn" class="play"></button>
 
@@ -87,6 +94,16 @@
     <div id="statusBox" class="status-box" style="display: none">
       <div class="spinner"></div>
       <p id="statusText">Uploading...</p>
+    </div>
+    <div id="exportOverlay" style="display: none">
+      <div id="exportCard">
+        <div id="exportSpinnerRing"></div>
+        <p id="exportLabel">Exporting…</p>
+        <div id="exportProgressTrack">
+          <div id="exportProgressBar"></div>
+        </div>
+        <p id="exportPercent">0%</p>
+      </div>
     </div>
   </body>
 </html>
