@@ -13,7 +13,7 @@ document.addEventListener("DOMContentLoaded", () => {
   konvaContainer.style.display = "none";
 
   if (!video || !container) return;
-  
+
 function showEditingOverlay() {
   const overlay = document.getElementById("editOverlay");
   if (!overlay) return;
@@ -192,11 +192,17 @@ function hideEditingOverlay() {
     return { x, y, w, h };
   }
 
+  // NOTE: getCropData() previously read against getVideoRenderBox() (the
+  // <video> element's outer CSS box). That box can include empty
+  // letterbox/pillarbox space when the source's intrinsic aspect ratio
+  // doesn't match the box's shape. Crop math needs to be relative to the
+  // actual visible video content, so this now uses getIntrinsicVideoRect()
+  // — the same rect banner-snapping already relies on.
   function getCropData() {
-    const vb = getVideoRenderBox();
+    const vb = getIntrinsicVideoRect();
     return {
-      nx: Math.max(0, (cropRectangle.x() - vb.left) / vb.w),
-      ny: Math.max(0, (cropRectangle.y() - vb.top) / vb.h),
+      nx: Math.max(0, (cropRectangle.x() - vb.x) / vb.w),
+      ny: Math.max(0, (cropRectangle.y() - vb.y) / vb.h),
       nw: Math.min(1, cropRectangle.width() / vb.w),
       nh: Math.min(1, cropRectangle.height() / vb.h),
     };
@@ -240,9 +246,19 @@ function hideEditingOverlay() {
   const ratio169Btn = document.getElementById("ratio169");
   const ratio11Btn = document.getElementById("ratio11");
 
+  // NOTE: showCropBox() previously sized/positioned the crop rectangle
+  // against getVideoRenderBox() (the <video> element's outer CSS box).
+  // When the source video's intrinsic aspect ratio doesn't match that box
+  // (letterboxing/pillarboxing from object-fit: contain), the outer box
+  // includes empty space that isn't part of the actual footage. For a
+  // ratio like 1:1 this often happened to still look right by coincidence,
+  // but 16:9 would come out sized/positioned against the empty bars
+  // instead of the real video content. Using getIntrinsicVideoRect() here
+  // (same rect banner snapping already relies on) fixes that for every
+  // ratio consistently.
   function showCropBox(ratio) {
     currentAspectRatio = ratio;
-    const vb = getVideoRenderBox();
+    const vb = getIntrinsicVideoRect();
     let boxW, boxH;
     if (ratio) {
       boxW = vb.w;
@@ -255,8 +271,8 @@ function hideEditingOverlay() {
       boxW = vb.w * 0.6;
       boxH = vb.h * 0.6;
     }
-    const startX = vb.left + (vb.w - boxW) / 2;
-    const startY = vb.top + (vb.h - boxH) / 2;
+    const startX = vb.x + (vb.w - boxW) / 2;
+    const startY = vb.y + (vb.h - boxH) / 2;
     cropRectangle.position({ x: startX, y: startY });
     cropRectangle.width(boxW);
     cropRectangle.height(boxH);
@@ -520,15 +536,34 @@ function hideEditingOverlay() {
     });
   }
 
+  // ── FIXED: showCroppedPreview ───────────────────────────────────────────
+  // Previously this treated the container's raw clientWidth/clientHeight
+  // (cw/ch) as if that were the native, unscaled size of the full video
+  // frame. That's only true when the video exactly fills the container.
+  // Any time the video's intrinsic aspect ratio doesn't match the
+  // container's shape (letterboxing/pillarboxing from object-fit: contain
+  // — true for most 16:9 or 1:1 crops), cw/ch no longer represent the
+  // video's actual content size, so the scale factor, clip-path offsets,
+  // and video positioning were all computed against the wrong box —
+  // producing a crop preview that looked wrong or didn't visibly apply.
+  //
+  // Fix: use getIntrinsicVideoRect() (vb) — the same helper the crop-box
+  // UI and banner snapping already rely on — as the reference size for
+  // the video's "native" unscaled frame. cw/ch are still used, but only
+  // for centering the crop-selection box on screen.
   function showCroppedPreview(crop) {
     const { nx, ny, nw, nh } = crop;
     const cw = container.clientWidth;
     const ch = container.clientHeight;
 
-    let currentVideoW = cw;
-    let currentVideoH = ch;
-    let currentVideoLeft = cw / 2 - (nx + nw / 2) * cw;
-    let currentVideoTop = ch / 2 - (ny + nh / 2) * ch;
+    // The video's actual native content box (accounts for letterbox/
+    // pillarbox). nx/ny/nw/nh are fractions of THIS box, not of cw/ch.
+    const vb = getIntrinsicVideoRect();
+
+    let currentVideoW = vb.w;
+    let currentVideoH = vb.h;
+    let currentVideoLeft = cw / 2 - (nx + nw / 2) * currentVideoW;
+    let currentVideoTop = ch / 2 - (ny + nh / 2) * currentVideoH;
 
     function applyVideoStyle() {
       video.style.position = "absolute";
@@ -536,6 +571,11 @@ function hideEditingOverlay() {
       video.style.height = `${currentVideoH}px`;
       video.style.left = `${currentVideoLeft}px`;
       video.style.top = `${currentVideoTop}px`;
+      // We're manually sizing the video to an arbitrary scaled box below.
+      // Force "fill" so the browser doesn't re-letterbox the content
+      // inside that box on top of our own math (which already accounts
+      // for the real aspect ratio via vb).
+      video.style.objectFit = "fill";
       video.style.clipPath = `inset(
         ${ny * 100}%
         ${(1 - nx - nw) * 100}%
@@ -556,8 +596,8 @@ function hideEditingOverlay() {
     layer.destroyChildren();
     if (bannerLayer) bannerLayer.moveToTop();
 
-    const initW = nw * cw;
-    const initH = nh * ch;
+    const initW = nw * vb.w;
+    const initH = nh * vb.h;
     const initX = cw / 2 - initW / 2;
     const initY = ch / 2 - initH / 2;
 
@@ -669,10 +709,10 @@ function hideEditingOverlay() {
         h: bh,
       };
 
-      const scaleX = bw / (nw * cw);
-      const scaleY = bh / (nh * ch);
-      currentVideoW = cw * scaleX;
-      currentVideoH = ch * scaleY;
+      const scaleX = bw / (nw * vb.w);
+      const scaleY = bh / (nh * vb.h);
+      currentVideoW = vb.w * scaleX;
+      currentVideoH = vb.h * scaleY;
       const cropCX = (nx + nw / 2) * currentVideoW;
       const cropCY = (ny + nh / 2) * currentVideoH;
       currentVideoLeft = bx + bw / 2 - cropCX;
