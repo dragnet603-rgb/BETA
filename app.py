@@ -448,7 +448,7 @@ def edit_video(filename):
 
     cmd = ["ffmpeg", "-y", "-i", input_path,
            "-vf", ",".join(vf_parts),
-           "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
            "-c:a", "copy", output_path]
 
     print("FFmpeg command:", " ".join(cmd))
