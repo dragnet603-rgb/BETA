@@ -728,9 +728,32 @@ def upload():
 
 _chunk_store = {}
 
+# Abandoned chunked uploads (browser closed mid-upload) must not pile up
+# forever on a small server. Parts older than this are removed.
+_CHUNK_UPLOAD_TTL = 60 * 60  # seconds
+
+
+def _prune_chunk_uploads():
+    """Drop stale in-progress chunk uploads: metadata + temp part files."""
+    now = time.time()
+    for name in [
+        n for n, s in _chunk_store.items()
+        if now - s.get("updated", 0) > _CHUNK_UPLOAD_TTL
+    ]:
+        _chunk_store.pop(name, None)
+        shutil.rmtree(UPLOAD_FOLDER / f"_tmp_{name}", ignore_errors=True)
+    # Also sweep orphaned temp dirs with no matching metadata entry.
+    try:
+        for tmp_dir in UPLOAD_FOLDER.glob("_tmp_*"):
+            if now - tmp_dir.stat().st_mtime > _CHUNK_UPLOAD_TTL:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+    except OSError:
+        pass
+
 
 @app.post("/upload-chunk")
 def upload_chunk():
+    _prune_chunk_uploads()
     chunk = request.files.get("chunk")
     filename = request.form.get("filename", "")
 
@@ -766,6 +789,7 @@ def upload_chunk():
     )
 
     store["received"].add(chunk_index)
+    store["updated"] = time.time()
 
     if len(store["received"]) < total_chunks:
         return jsonify({
@@ -1498,6 +1522,17 @@ def ffmpeg_filter_path(path):
 _export_jobs = {}
 _export_jobs_lock = threading.Lock()
 _EXPORT_JOB_TTL = 30 * 60  # seconds
+
+# Cap concurrent FFmpeg processes. libx264 encodes can use 150-400MB each;
+# on a 512MB server more than one at a time will trigger the OOM killer.
+# Override with the FFMPEG_MAX_CONCURRENT env var.
+_FFMPEG_SLOTS = threading.Semaphore(
+    max(1, int(os.environ.get("FFMPEG_MAX_CONCURRENT", "1")))
+)
+
+# Cap encoder threads so FFmpeg doesn't spawn one thread per CPU core
+# (multiplies memory) on a memory-constrained host.
+_FFMPEG_THREADS = max(1, min(2, os.cpu_count() or 1))
 
 
 def _create_export_job():
@@ -2295,6 +2330,10 @@ def edit_video(filename):
             "veryfast",
             "-crf",
             "20",
+            # Cap encoder threads: x264 defaults to one thread per core,
+            # which multiplies memory use. Fatal on 512MB servers.
+            "-threads",
+            str(_FFMPEG_THREADS),
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -2334,11 +2373,24 @@ def edit_video(filename):
     print("[Autoquence] FFmpeg:", " ".join(command))
 
     _prune_export_jobs()
+
+    # Refuse politely instead of risking an OOM kill when an encode is
+    # already running on a small server.
+    if not _FFMPEG_SLOTS.acquire(blocking=False):
+        return jsonify({
+            "error": "Server is busy rendering another video. Please retry in a moment.",
+        }), 429
+
     job_id = _create_export_job()
 
+    def _export_worker(**kwargs):
+        try:
+            _run_ffmpeg_export(job_id, command, output_filename, **kwargs)
+        finally:
+            _FFMPEG_SLOTS.release()
+
     threading.Thread(
-        target=_run_ffmpeg_export,
-        args=(job_id, command, output_filename),
+        target=_export_worker,
         kwargs={
             "expected_duration": expected_duration,
             "text_files": banner_text_files,
