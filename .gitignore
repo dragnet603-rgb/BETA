@@ -3,9 +3,6 @@ __pycache__/
 .env
 
 # User-generated media — never commit uploads/exports/test artifacts
-BETA/static/uploads/
-BETA/static/outputs/
-BETA/static/promptbeta/
 static/uploads/
 static/outputs/
 static/promptbeta/
