@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+
+# User-generated media — never commit uploads/exports/test artifacts
+BETA/static/uploads/
+BETA/static/outputs/
+BETA/static/promptbeta/
+static/uploads/
+static/outputs/
+static/promptbeta/
+code_backup_*/
+
+# Logs, temp and backup files
+*.log
+*.tmp
+*.bak

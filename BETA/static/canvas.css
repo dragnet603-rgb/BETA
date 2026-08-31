@@ -1,0 +1,868 @@
+/* =========================
+Autofill fix
+========================= */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+-webkit-box-shadow: 0 0 0px 1000px transparent inset !important;
+-webkit-text-fill-color: white !important;
+transition: background-color 9999s ease-in-out 0s;
+}
+/* =========================
+Tap highlight removal
+========================= */
+.export,
+.uploadBtn,
+.play {
+-webkit-tap-highlight-color: transparent;
+}
+/* =========================
+Base layout
+========================= */
+body {
+background-color: rgb(2, 2, 2);
+display: flex;
+justify-content: center;
+align-items: center;
+flex-direction: column;
+min-height: 100dvh;
+margin: 0;
+}
+/* =========================
+Header
+========================= */
+.promptrText {
+position: absolute;
+top: 3vw;
+left:3vw;
+
+}
+.promptrText h1 {
+color: white;
+font-family: sans-serif;
+font-size: 6vw;
+margin: 0;
+
+}
+.export {
+position: absolute;
+top: 2.5vw;
+right: 3vw;
+width: 15vw;
+max-width: 120px;
+background: rgb(66, 63, 63);
+border: 2px solid white;
+border-radius: 20px;
+display: flex;
+justify-content: center;
+align-items: center;
+cursor: pointer;
+transition: 0.1s ease;
+}
+.export h1 {
+color: white;
+font-family: sans-serif;
+font-size: 3vw;
+pointer-events: none;
+}
+.export:active {
+transform: scale(0.95);
+background: rgb(60, 60, 60);
+}
+.link {
+text-decoration: none;
+}
+/* =========================
+Video container
+========================= */
+.canvas-container {
+  position: relative;
+  width: 100vw;
+  max-width: 200px;
+  aspect-ratio: 9 / 16;
+  border: 10px transparent rgb(2, 2, 2);
+  
+  background: rgba(48, 44, 44, 0.9);
+  border-radius: 20px;
+
+  overflow: visible;
+
+  margin-bottom: 15vh;
+
+  transform: scale(1);
+  transform-origin: center center;
+  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.canvas {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  border-radius: 20px;
+  
+}
+
+body.keyboard-open .canvas-container {
+  transform: translateY(170px) scale(0.6);
+}
+
+body.keyboard-open {
+  overflow: hidden;
+  height: 100dvh;
+  touch-action: none;
+}
+
+#konvaStage {
+  /* Positioned relative to .canvas-container (overflow:visible),
+     NOT inside .canvas (overflow:hidden).
+     This lets banners expand above/below the video without being clipped. */
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 999;
+  pointer-events: all;
+  overflow: visible;
+  
+}
+.canvas video {
+width: 100%;
+height: 100%;
+object-fit: contain;
+
+}
+canvas#videoCanvas {
+position: absolute;
+inset: 0;
+width: 100%;
+height: 100%;
+pointer-events: none;
+}
+
+
+/* =========================
+Undo / Redo bar
+========================= */
+#undoRedoBar {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  z-index: 9000;
+}
+.aq-icon-btn {
+  background: rgba(66,63,63,0.9);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 8px;
+  color: white;
+  font-size: 18px;
+  width: 36px;
+  height: 36px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.15s;
+}
+.aq-icon-btn:active  { background: rgba(100,100,100,0.9); }
+.aq-icon-btn:disabled { opacity: 0.35; pointer-events: none; }
+
+/* =========================
+AI response box
+========================= */
+/* .aq-response-box {
+  position: fixed;
+  bottom: calc(6vh + 60px);
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 85%;
+  background: rgba(20,20,20,0.92);
+  color: #f0f0f0;
+  font-family: Arial, sans-serif;
+  font-size: 13px;
+  border: 1px solid yellowgreen;
+  border-radius: 12px;
+  padding: 10px 16px;
+  z-index: 9998;
+  text-align: center;
+  backdrop-filter: blur(4px);
+} */
+/* .aq-response-box {
+  position: fixed;
+  bottom: calc(6vh + 60px);
+  left: 50%;
+  transform: translateX(-50%);
+
+  width: min(700px, 88%);
+  min-height: 48px;
+  box-sizing: border-box;
+
+  background: #181818;
+  color: #f5f5f5;
+
+  font-family: Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 18px;
+
+  padding: 14px 18px;
+
+  z-index: 9998;
+
+  text-align: left;
+
+  box-shadow:
+    0 10px 35px rgba(0, 0, 0, 0.3);
+
+  backdrop-filter: blur(12px);
+
+  transition: all 0.2s ease;
+} */
+ .aq-response-box {
+  position: fixed;
+  bottom: calc(6vh + 45px);
+  left: 50%;
+  transform: translateX(-50%) translateY(8px);
+
+  width: min(720px, 88%);
+  min-height: 45px;
+  box-sizing: border-box;
+
+  /* background: rgba(18, 18, 20, 0.92); */
+  background: transparent;
+  color: #f5f5f5;
+
+  font-family: Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  
+ 
+  /* border: 1px solid rgba(255, 255, 255, 0.12); */
+  border-radius: 18px;
+
+  padding: 14px 44px 14px 58px;
+
+  z-index: 9998;
+  text-align: left;
+
+  box-shadow: 0 10px 35px rgba(0, 0, 0, 0.3);
+
+  backdrop-filter: blur(12px);
+
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.25s ease,
+    transform 0.25s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.25s ease;
+}
+
+.aq-response-box.aq-visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  pointer-events: auto;
+}
+
+/* Variant accents */
+.aq-response-box.aq-success { border-color: rgba(45, 238, 6, 0.55); }
+.aq-response-box.aq-error   { border-color: rgba(255, 82, 82, 0.65); }
+
+/* Close button */
+.aq-response-close {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: #999;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.aq-response-close:hover,
+.aq-response-close:active { background: rgba(255,255,255,0.12); color: #fff; }
+
+/* Thinking state */
+.aq-thinking-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 10px;
+  border-radius: 50%;
+  background: greenyellow;
+  animation: aqThinkPulse 1s ease-in-out infinite;
+  vertical-align: middle;
+}
+@keyframes aqThinkPulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1.15); }
+}
+
+.aq-response-box::before {
+  content: "";
+
+  position: absolute;
+  left: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+
+  width: 30px;
+  height: 30px;
+
+  background-image: url("/static/images/autoquence.webp");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+}
+/* =========================
+Crop controls (visible when active)
+========================= */
+#cropControls {
+  position: fixed;
+  bottom: calc(6vh + 40px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 99999;
+  display: none;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.aq-ctrl-btn {
+  padding: 10px 18px;
+  font-size: 14px;
+  background: rgba(66,63,63,0.95);
+  color: white;
+  border: 1px solid rgba(255,255,255,0.25);
+  border-radius: 20px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.aq-ctrl-btn:active  { opacity: 0.75; }
+.aq-ctrl-apply       { background: #2dee06; color: #111; border-color: #2dee06; font-weight: bold; }
+
+/* =========================
+Autoquence rendered elements
+canvas.js uses .aq-el as the base class for ALL AI-placed elements
+========================= */
+.aq-el {
+  position: absolute;
+  box-sizing: border-box;
+  pointer-events: auto;
+  user-select: none;
+}
+
+/* Legacy alias used by older code */
+.aq-element {
+  position: absolute;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+
+.aq-text {
+  word-break: break-word;
+  white-space: normal;
+  line-height: 1.3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.aq-shape {}
+.aq-image { object-fit: contain; }
+
+/* =========================
+Play button
+Sits directly BELOW canvas
+and moves/scales with it
+========================= */
+
+.play {
+  position: absolute;
+  left: 50%;
+  bottom: auto;
+
+  /* Put it below the canvas */
+  transform: translate(-50%, calc(100% + 110px));
+
+  width: 40px;
+  height: 40px;
+
+  background: transparent;
+  border: none;
+  cursor: pointer;
+
+  z-index: 1000;
+  -webkit-tap-highlight-color: transparent;
+
+  opacity: 1;
+  visibility: visible;
+  transition:
+    transform 0.35s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.2s ease;
+}
+body.keyboard-open .play {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.play::before {
+  content: "";
+  position: absolute;
+
+  top: 50%;
+  left: 50%;
+
+  transform: translate(-2px, -50%);
+
+  border-top: 10px solid transparent;
+  border-bottom: 10px solid transparent;
+  border-left: 16px solid white;
+}
+
+.play.active::before {
+  border: none;
+
+  width: 6px;
+  height: 20px;
+
+  background: white;
+
+  transform: translate(-8px, -50%);
+}
+/* Right vertical bar of the pause (⏸) icon. The left bar is the
+   ::before above; this ::after draws the second, right-hand bar so
+   the pause glyph shows two vertical lines instead of one. */
+.play.active::after {
+  content: "";
+  position: absolute;
+
+  top: 50%;
+  left: 50%;
+
+  width: 6px;
+  height: 20px;
+
+  background: white;
+
+  transform: translate(8px, -50%);
+}
+/* =========================
+Text overlay (legacy)
+========================= */
+.textOverlay {
+position: absolute;
+color: white;
+font-family: sans-serif;
+font-size: 4vw;
+max-width: 90%;
+word-wrap: break-word;
+pointer-events: none;
+}
+/* =========================
+Input bar
+========================= */
+.inputWrapper {
+position: fixed;
+bottom: 2vh;
+left: 50%;
+transform: translateX(-50%);
+width: 90%;
+max-width: 310px;
+height: 4vh;
+/* background-color: rgb(66, 63, 63); */
+background-color: rgba(48, 44, 44, 0.9);
+border-radius: 40px;
+display: flex;
+align-items: center;
+gap: 5px;
+padding: 15px;
+z-index: 9999;
+
+
+}
+.promptInput {
+flex: 1;
+min-width: 0;
+border: none;
+outline: none;
+background: transparent;
+color: white;
+font-size: 4vw;
+
+transform: translateX(18px);
+
+}
+.uploadBtn {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  transform: translateX(6px);
+}
+
+.uploadBtn img {
+  width: 40%;
+  height: auto;
+  object-fit: contain;
+}
+
+.uploadBtn:active {
+  transform: translateX(6px) translateY(2px) scale(0.95);
+}
+
+.uploadBtn.loading {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  background: greenyellow;
+  border-radius: 50%;
+  pointer-events: none;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.uploadBtn.loading img {
+  display: none;
+}
+
+.uploadBtn.loading::after {
+  content: "•••";
+  color: white;
+  font-size: 16px;
+  letter-spacing: 2px;
+  line-height: 1;
+  animation: dots 1s infinite;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+
+
+}
+
+@keyframes dots {
+  0%, 20% {
+    opacity: 0.2;
+  }
+
+  50% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0.2;
+  }
+}
+.canvas.processing video {
+  filter: blur(4px) brightness(0.78);
+  transition: filter 0.35s ease;
+}
+/* #konvaStage is now a sibling of .canvas — select it via .canvas-container */
+.canvas.processing ~ #konvaStage {
+  filter: blur(4px) brightness(0.78);
+  transition: filter 0.35s ease;
+}
+.edit-overlay {
+position: absolute;
+inset: 0;
+display: none;
+align-items: center;
+justify-content: center;
+z-index: 2000;
+background: rgba(0, 0, 0, 0.12);
+}
+.edit-overlay.active { display: flex; }
+.edit-overlay-content {
+display: flex;
+flex-direction: row;
+align-items: center;
+gap: 10px;
+padding: 10px 18px;
+border-radius: 999px;
+background: rgba(10, 10, 14, 0.55);
+backdrop-filter: blur(6px);
+-webkit-backdrop-filter: blur(6px);
+box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 8px 32px rgba(0,0,0,0.35);
+}
+/* Minimal "generating" pulse dot (replaces the old generation orb) */
+.gen-dot {
+width: 10px;
+height: 10px;
+border-radius: 50%;
+background: greenyellow;
+box-shadow: 0 0 10px rgba(151, 255, 125, 0.8);
+animation: genDotPulse 1.1s ease-in-out infinite;
+}
+@keyframes genDotPulse {
+  0%, 100% { transform: scale(0.75); opacity: 0.45; }
+  50%      { transform: scale(1.15); opacity: 1; }
+}
+#editOverlayText {
+color: white;
+font-family: Arial, sans-serif;
+font-size: 14px;
+font-weight: 600;
+margin: 0;
+min-height: 1.4em;
+letter-spacing: 0.02em;
+text-shadow: 0 1px 3px rgba(0,0,0,0.6);
+}
+
+/* ============================================================
+   GENERATION ORB
+   The "AI is generating" centerpiece. Everything animates via
+   transform/opacity only (compositor-friendly).
+   ============================================================ */
+.gen-orb {
+  position: relative;
+  width: 84px;
+  height: 84px;
+}
+
+/* Soft breathing halo behind everything */
+.gen-orb-glow {
+  position: absolute;
+  inset: -22px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(79,142,247,0.35) 0%, rgba(79,142,247,0.12) 45%, transparent 70%);
+  animation: genGlowPulse 2.8s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* Rotating conic arc ring */
+.gen-orb-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background:
+    conic-gradient(
+      from 0deg,
+      rgba(79,142,247,0) 0deg,
+      rgba(79,142,247,0.15) 90deg,
+      rgba(122,205,255,0.85) 200deg,
+      #ffffff 260deg,
+      rgba(79,142,247,0) 360deg
+    );
+  -webkit-mask-image: radial-gradient(circle, transparent 58%, #000 62%);
+  mask-image: radial-gradient(circle, transparent 58%, #000 62%);
+  animation: genRingSpin 3s linear infinite;
+}
+
+/* Breathing core */
+.gen-orb-core {
+  position: absolute;
+  inset: 22px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 42% 38%,
+      #ffffff 0%,
+      #a9ccff 30%,
+      #4f8ef7 62%,
+      rgba(46,90,190,0.9) 100%
+    );
+  box-shadow: 0 0 18px rgba(110,170,255,0.65), 0 0 44px rgba(79,142,247,0.3);
+  animation: genCoreBreath 2.6s ease-in-out infinite;
+}
+
+/* Particle orbit wrappers — spin the whole wrapper so the dot itself
+   only does counter-rotation-free circular motion */
+.gen-orb-orbit {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.gen-orb-particle {
+  position: absolute;
+  top: -2px;
+  left: 50%;
+  width: 6px;
+  height: 6px;
+  margin-left: -3px;
+  border-radius: 50%;
+  background: #cfe4ff;
+  box-shadow: 0 0 8px rgba(160,210,255,0.9);
+}
+.gen-orb-orbit.o1 { animation: genOrbitSpin 2.1s linear infinite; }
+.gen-orb-orbit.o2 {
+  inset: 9px;
+  animation: genOrbitSpin 1.5s linear infinite reverse;
+}
+.gen-orb-orbit.o3 {
+  inset: -7px;
+  animation: genOrbitSpin 3.2s linear infinite;
+}
+
+@keyframes genRingSpin {
+  to { transform: rotate(360deg); }
+}
+@keyframes genCoreBreath {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50%      { transform: scale(0.86); opacity: 0.82; }
+}
+@keyframes genGlowPulse {
+  0%, 100% { transform: scale(1); opacity: 0.9; }
+  50%      { transform: scale(1.18); opacity: 0.55; }
+}
+@keyframes genOrbitSpin {
+  to { transform: rotate(360deg); }
+}
+
+/* Respect users who opt out of motion: keep the glow identity,
+   drop all movement */
+@media (prefers-reduced-motion: reduce) {
+  .gen-orb-ring,
+  .gen-orb-core,
+  .gen-orb-glow,
+  .gen-orb-orbit {
+    animation: none !important;
+  }
+}
+#exportOverlay {
+position: fixed;
+inset: 0;
+background: rgba(0, 0, 0, 0.85);
+display: flex;
+align-items: center;
+justify-content: center;
+z-index: 9999;
+backdrop-filter: blur(4px);
+}
+#exportCard {
+background: #1a1a1a;
+border: 1px solid #2a2a2a;
+border-radius: 16px;
+padding: 40px 48px;
+display: flex;
+flex-direction: column;
+align-items: center;
+gap: 16px;
+min-width: 200px;
+}
+#exportSpinnerRing {
+width: 48px;
+height: 48px;
+border: 4px solid #2a2a2a;
+border-top-color: #4f8ef7;
+border-radius: 50%;
+animation: spin 0.8s linear infinite;
+}
+#exportLabel {
+color: #ffffff;
+font-size: 15px;
+font-weight: 500;
+margin: 0;
+font-family: Arial, sans-serif;
+}
+#exportProgressTrack {
+width: 180px;
+height: 4px;
+background: #2a2a2a;
+border-radius: 99px;
+overflow: hidden;
+}
+#exportProgressBar {
+height: 100%;
+width: 0%;
+background: linear-gradient(90deg, #2dee06, #02f029);
+border-radius: 99px;
+transition: width 0.2s ease;
+}
+#exportPercent {
+color: #888888;
+font-size: 13px;
+margin: 0;
+font-family: Arial, sans-serif;
+}
+@keyframes spin {
+to {
+transform: rotate(360deg);
+}
+}
+/* =========================
+Loader
+========================= */
+.loader {
+position: fixed;
+inset: 0;
+background: rgba(0, 0, 0, 0.6);
+display: flex;
+flex-direction: column;
+justify-content: center;
+align-items: center;
+color: white;
+font-size: 5vw;
+z-index: 9999;
+}
+.loader.hidden {
+display: none;
+}
+.spinner {
+width: 12vw;
+max-width: 50px;
+height: 12vw;
+max-height: 50px;
+border: 6px solid #f3f3f3;
+border-top: 6px solid #3498db;
+border-radius: 50%;
+animation: spin 1s linear infinite;
+}
+/* =========================
+TABLET+
+========================= */
+@media (min-width: 768px) {
+.promptrText h1 {
+font-size: 4vw;
+}
+.export h1 {
+font-size: 1.5vw;
+}
+.textOverlay {
+font-size: 2.5vw;
+}
+.promptInput {
+font-size: 2vw;
+}
+.uploadBtn {
+width: 6vw;
+height: 6vw;
+}
+}
+/* =========================
+DESKTOP
+========================= */
+@media (min-width: 1200px) {
+.promptrText h1 {
+font-size: 1vw;
+}
+.export h1 {
+font-size: 1vw;
+}
+.textOverlay {
+font-size: 2vw;
+}
+.promptInput {
+font-size: 1.5vw;
+max-width: 700px;
+}
+}
