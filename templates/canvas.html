@@ -148,5 +148,9 @@
         <p id="exportPercent">0%</p>
       </div>
     </div>
+    <!-- Firebase config must load BEFORE auth.js (module) -->
+    <script src="{{ static_v('firebase-config.js') }}"></script>
+    <!-- Firebase auth: session check + profile avatar -->
+    <script type="module" src="{{ static_v('auth.js') }}"></script>
   </body>
 </html>

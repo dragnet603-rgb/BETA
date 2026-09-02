@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, send_file, url_for
+from flask import Flask, render_template, request, jsonify, send_file, session, url_for
 import gzip
 import json
 import os
@@ -18,9 +18,9 @@ except ImportError:
     Image = None
     ImageFilter = None
     ImageFont = None
-from openai import OpenAI
 
 from autoquence_v3 import AutoquenceAI, SceneGraph, VideoInfo, SceneElement
+import stats as _stats
 from or_reasoning import reasoning_extra_body, extract_reasoning_details
 
 
@@ -57,6 +57,22 @@ app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 # Templates reference them via static_v() which appends an mtime-based
 # ?v=... query so every deploy busts the cache automatically.
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 31536000
+
+# ------------------------------------------------------------
+# FIREBASE AUTH (email/password + Google + magic links)
+#
+# Client signs in with the Firebase JS SDK, POSTs the ID token
+# to /api/auth/session, and the server responds with a signed
+# Flask session cookie that gates every other route. See
+# firebase_auth.py. Disabled entirely when FIREBASE_PROJECT_ID
+# is not set (local dev).
+# ------------------------------------------------------------
+from firebase_auth import AUTH_ENABLED, auth_bp  # noqa: E402
+
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or os.urandom(32).hex()
+app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 31  # 31 days
+app.register_blueprint(auth_bp)
+
 
 
 # ============================================================
@@ -129,8 +145,17 @@ if not OPENROUTER_API_KEY:
     print("WARNING: OPENROUTER_API_KEY is not configured.")
 
 # Keep one AutoquenceAI instance so its own history/undo implementation,
-# if enabled by autoquence_v3.py, remains available.
-autoquence_ai = AutoquenceAI()
+# if enabled by autoquence_v3.py, remains available. Created LAZILY on
+# first use - constructing the Gemini client at import time made server
+# startup hang for tens of seconds (flaky SSL context setup).
+_autoquence_ai = None
+
+
+def get_autoquence_ai():
+    global _autoquence_ai
+    if _autoquence_ai is None:
+        _autoquence_ai = AutoquenceAI()
+    return _autoquence_ai
 
 
 # ============================================================
@@ -211,12 +236,23 @@ def _clean_reply_line(reply: str) -> str:
 
 # One shared OpenAI client for the whole app: connection pooling means
 # conversational prompts skip a fresh TLS handshake (~100-300ms) that
-# per-request client creation used to pay on every message.
-_chat_client = OpenAI(
-    api_key=OPENROUTER_API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-    timeout=30.0,
-) if OPENROUTER_API_KEY else None
+# per-request client creation used to pay on every message. Created
+# lazily - importing the openai SDK at module load added ~18s to every
+# server start.
+_chat_client = None
+
+
+def _get_chat_client():
+    global _chat_client
+    if _chat_client is None and OPENROUTER_API_KEY:
+        from openai import OpenAI
+
+        _chat_client = OpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            timeout=30.0,
+        )
+    return _chat_client
 
 
 def answer_conversation(prompt: str, history, available_fonts=None):
@@ -231,7 +267,7 @@ def answer_conversation(prompt: str, history, available_fonts=None):
     """
     fonts = ", ".join(available_fonts or []) or "standard system fonts"
 
-    if _chat_client is None:
+    if _get_chat_client() is None:
         return "", None
 
     messages = (
@@ -246,7 +282,7 @@ def answer_conversation(prompt: str, history, available_fonts=None):
     )
 
     try:
-        response = _chat_client.chat.completions.create(
+        response = _get_chat_client().chat.completions.create(
             model=CHAT_MODEL,
             messages=messages,
             temperature=0.4,
@@ -285,7 +321,6 @@ def conversation_response(message: str, reasoning_details=None) -> dict:
     if reasoning_details:
         resp["reasoning_details"] = reasoning_details
     return resp
-autoquence_ai = AutoquenceAI()
 
 
 # ============================================================
@@ -715,6 +750,7 @@ def upload():
         return jsonify({"error": "Invalid filename."}), 400
 
     file.save(UPLOAD_FOLDER / filename)
+    _stats.log_event(session.get("email", ""), session.get("uid", ""), "uploaded", filename)
 
     return jsonify({
         "status": "complete",
@@ -815,6 +851,7 @@ def upload_chunk():
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     _chunk_store.pop(safe_name, None)
+    _stats.log_event(session.get("email", ""), session.get("uid", ""), "uploaded", safe_name)
 
     return jsonify({
         "status": "complete",
@@ -831,6 +868,8 @@ def autoquence_edit():
     data = request.get_json(silent=True) or {}
 
     prompt = str(data.get("prompt") or "").strip()
+    if prompt:
+        _stats.log_event(session.get("email", ""), session.get("uid", ""), "prompt_sent", prompt[:100])
     scene_data = data.get("scene")
 
     # --------------------------------------------------------
@@ -935,7 +974,7 @@ def autoquence_edit():
     try:
         scene = build_scene(scene_data)
 
-        result = autoquence_ai.process(
+        result = get_autoquence_ai().process(
             user_prompt=prompt,
             scene=scene,
             available_assets=data.get("available_assets") or [],
@@ -999,7 +1038,7 @@ def legacy_edit_json(filename):
     # Do not route new prompts through a second incompatible LLM format.
     # Build a minimal scene and use the same V3 planner.
     try:
-        result = autoquence_ai.process(
+        result = get_autoquence_ai().process(
             user_prompt=prompt,
             scene=SceneGraph(
                 video=VideoInfo(
@@ -1573,6 +1612,7 @@ def _prune_export_jobs():
 def edit_video(filename):
     data = request.get_json(silent=True) or {}
     raw_edits = data.get("edits") or []
+    _stats.log_event(session.get("email", ""), session.get("uid", ""), "export_started", filename)
 
     if not isinstance(raw_edits, list):
         return jsonify({"error": "edits must be an array."}), 400
@@ -2468,6 +2508,7 @@ def _run_ffmpeg_export(job_id, command, output_filename, expected_duration=0.0, 
             progress=100.0,
             output_file=output_filename,
         )
+        _stats.log_event("", "", "export_completed", output_filename)
 
     except FileNotFoundError:
         _update_export_job(
@@ -2528,6 +2569,7 @@ def export_upload(filename):
         return jsonify({"error": f"Unsupported export format: {ext}"}), 400
 
     output_filename = safe_filename(f"{input_path.stem}_edited{ext}")
+    _stats.log_event(session.get("email", ""), session.get("uid", ""), "export_completed", output_filename)
     output_path = OUTPUT_FOLDER / output_filename
 
     # Overwrite is intentional — matches FFmpeg's "-y" behavior so
@@ -2561,6 +2603,22 @@ def download(filename):
     )
     response.headers["Cache-Control"] = "no-store, max-age=0"
     return response
+
+
+# ============================================================
+# ADMIN STATS PAGE
+# ============================================================
+
+@app.route("/admin")
+def admin_page():
+    if not _stats.is_admin(session.get("email", "")):
+        return jsonify(error="forbidden"), 403
+    return render_template(
+        "admin.html",
+        counts=_stats.counts(),
+        recent=_stats.recent(80),
+        users=_stats.per_user(),
+    )
 
 
 # ============================================================

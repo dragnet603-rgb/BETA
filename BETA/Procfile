@@ -1,3 +1,0 @@
-# Gunicorn production entrypoint. Exports are now async (job-based),
-# so workers are never tied up rendering video.
-web: gunicorn app:app --workers 2 --threads 8 --timeout 300 --bind 0.0.0.0:$PORT

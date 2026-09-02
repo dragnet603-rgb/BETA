@@ -32,6 +32,9 @@
       <h1>Autoquence</h1>
     </div>
 
+    <!-- Filled by auth.js: profile avatar + menu (index page only) -->
+    <div id="profileSlot"></div>
+
     <div id="addP" class="addPage">+</div>
 
     <div class="tapInstruction">
@@ -67,5 +70,9 @@
     <!-- Scripts go LAST so they can find the overlay div above -->
     <!-- <script src="{{ url_for('static', filename='script.js') }}"></script> -->
     <script src="{{ static_v('upload.js') }}"></script>
+    <!-- Firebase config must load BEFORE auth.js (module) -->
+    <script src="{{ static_v('firebase-config.js') }}"></script>
+    <!-- Firebase auth: session check + profile avatar -->
+    <script type="module" src="{{ static_v('auth.js') }}"></script>
   </body>
 </html>

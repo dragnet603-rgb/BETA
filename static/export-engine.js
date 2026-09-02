@@ -34,6 +34,18 @@
   // ─────────────────────────────────────────────────────────────
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // Race a promise against a deadline. If it has not settled in time, resolve
+  // with fallback so a hung audio/network step can never stall the whole
+  // export at the 2% mark (the abandoned operation keeps running in the
+  // background but is no longer awaited).
+  function withTimeout(promise, ms, fallback) {
+    let timer = null;
+    return Promise.race([
+      promise,
+      new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms); }),
+    ]).finally(() => { if (timer) clearTimeout(timer); });
+  }
+
   function evenize(n) {
     return Math.max(2, Math.floor(n / 2) * 2);
   }
@@ -143,7 +155,7 @@
     return {
       ready: function () {
         return Promise.all(vids.map(function (v) {
-          return waitForEvent(v, "loadedmetadata", 20000);
+          return waitForEvent(v, "loadedmetadata", 5000).catch(function () {});
         }));
       },
       video: function () { return vids[cur]; },
@@ -743,15 +755,16 @@
     if (typeof window.AudioEncoder !== "function") return null;
     let ac = null;
     try {
-      const resp = await fetch(sourceUrl);
-      if (!resp.ok) return null;
-      const bytes = await resp.arrayBuffer();
-      if (!bytes.byteLength) return null;
+      const resp = await withTimeout(fetch(sourceUrl), 8000, null);
+      if (!resp || !resp.ok) return null;
+      const bytes = await withTimeout(resp.arrayBuffer(), 8000, null);
+      if (!bytes || !bytes.byteLength) return null;
 
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return null;
       ac = new AC();
-      const decoded = await ac.decodeAudioData(bytes);
+      const decoded = await withTimeout(ac.decodeAudioData(bytes), 8000, null);
+      if (!decoded) return null;
 
       const sr = decoded.sampleRate;
       const chCount = Math.min(2, decoded.numberOfChannels);
@@ -765,7 +778,8 @@
       node.playbackRate.value = tl.speed;
       node.connect(oac.destination);
       node.start(0, tl.start, tl.end - tl.start);
-      const rendered = await oac.startRendering();
+      const rendered = await withTimeout(oac.startRendering(), 8000, null);
+      if (!rendered) return null;
 
       await ac.close(); ac = null;
 
@@ -785,9 +799,10 @@
 
       const chunks = [];
       let lastMeta = null;
+      let encError = null;
       const enc = new AudioEncoder({
         output: function (chunk, meta) { chunks.push(chunk); if (meta) lastMeta = meta; },
-        error: function (e) { console.warn("[EXPORT ENGINE] audio encoder:", e); },
+        error: function (e) { console.warn("[EXPORT ENGINE] audio encoder:", e); encError = e; },
       });
       enc.configure(cfg);
 
@@ -814,7 +829,11 @@
       await enc.flush();
       enc.close();
 
+      if (encError) return null;
       if (!chunks.length) return null;
+      // mp4-muxer requires decoderConfig metadata on the first audio chunk;
+      // without it addAudioChunk() would throw and abort the whole export.
+      if (!lastMeta || !lastMeta.decoderConfig) return null;
       return { chunks: chunks, meta: lastMeta, sampleRate: cfg.sampleRate, numberOfChannels: chCount };
     } catch (err) {
       console.warn("[EXPORT ENGINE] Audio export skipped:", err);
@@ -858,12 +877,26 @@
         numberOfChannels: audioPkt.numberOfChannels,
       };
     }
-    const muxer = new MuxerLib.Muxer(muxerConfig);
+    let muxer = new MuxerLib.Muxer(muxerConfig);
 
     // Mux the (already-encoded) audio track up front so finalize() isn't
     // serialized behind the video encode.
+    // GUARD: a broken audio packet (missing decoderConfig metadata, encoder
+    // failure, etc.) used to throw here and kill the whole export at the
+    // 2% mark. If audio muxing fails, rebuild a video-only muxer and
+    // continue — the user gets a silent MP4 instead of a failed export.
     if (audioPkt) {
-      for (const c of audioPkt.chunks) muxer.addAudioChunk(c, audioPkt.meta);
+      try {
+        for (const c of audioPkt.chunks) muxer.addAudioChunk(c, audioPkt.meta);
+      } catch (audioMuxErr) {
+        console.warn("[EXPORT ENGINE] Audio muxing failed — exporting without audio:", audioMuxErr);
+        state.warnings.push("Audio could not be muxed (encoder produced invalid data) — the MP4 will be silent.");
+        muxer = new MuxerLib.Muxer({
+          target: target,
+          video: { codec: "avc", width: geom.width, height: geom.height },
+          fastStart: "in-memory",
+        });
+      }
     }
 
     let encodeError = null;
