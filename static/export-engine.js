@@ -550,9 +550,13 @@
       const w = geom.placedW;
       const h = s.canvas.height * (w / s.canvas.width);
       const barOff = 0; // always flush to the picture edge
-      const y = isBot
-        ? geom.offY + geom.placedH - h - barOff
-        : geom.offY + barOff;
+      // Cleaned clip: the banner covers the blank band baked into the
+      // video - pin it to the band instead of the frame edge.
+      const y = (s.yFrac != null)
+        ? geom.offY + s.yFrac * geom.placedH
+        : (isBot
+          ? geom.offY + geom.placedH - h - barOff
+          : geom.offY + barOff);
       // Clamp fully inside the picture (matches bannerSnapY's clamp).
       const yFinal = Math.max(
         geom.offY,

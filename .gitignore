@@ -12,3 +12,4 @@ code_backup_*/
 *.log
 *.tmp
 *.bak
+static/processed/

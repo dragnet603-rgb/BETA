@@ -23,6 +23,13 @@ from autoquence_v3 import AutoquenceAI, SceneGraph, VideoInfo, SceneElement
 import stats as _stats
 from or_reasoning import reasoning_extra_body, extract_reasoning_details
 
+try:
+    from banner_cleaner import clean_if_needed, detect_white_banner, bake_cleaned_video
+    _BANNER_CLEANER_OK = True
+except ImportError as _bce:
+    print(f"[BANNER-CLEANER] module unavailable: {_bce}")
+    _BANNER_CLEANER_OK = False
+
 
 # ============================================================
 # AUTOQUENCE APP
@@ -860,6 +867,308 @@ def upload_chunk():
 
 
 # ============================================================
+# BAKED-BANNER CLEANING
+#
+# Uploaded clips often carry a banner + burned-in text baked into
+# the pixels. The planner can only edit scene elements — it cannot
+# touch source pixels — so before planning we detect such a banner
+# and re-encode a "clean" copy with the text blanked out. The
+# canvas is then pointed at the clean clip and the prompt is
+# planned against that.
+# ============================================================
+
+PROCESSED_FOLDER = Path("static/processed")
+
+# filename -> detection dict. Detection samples a dozen frames and
+# is not cheap, so each upload is analyzed only once per process.
+_banner_detect_cache: dict = {}
+
+
+def _cleaned_filename_for(filename: str) -> str:
+    """True when the filename is already a baked-clean output."""
+    return "_clean_" in filename
+
+
+# "remove the text from the banner" / "hide the text" / "delete banner text"…
+# Pixel-level operations the planner cannot perform (baked text is not a
+# scene element), so these prompts are short-circuited to the cleaner.
+_HIDE_TEXT_PATTERN = re.compile(
+    r"\b(remove|hide|delete|erase|clear|blank|get\s+rid\s+of)\b[^.?!]{0,60}?"
+    r"\b(text|writing|caption|subtitle|banner)\b",
+    re.IGNORECASE,
+)
+
+# "add a text" / "write some words" / "put a caption"...
+_ADD_TEXT_PATTERN = re.compile(
+    r"\b(add|create|put|place|write|insert|make|type)\b[^.?!]{0,40}?"
+    r"\b(text|texts|words?|caption|writing|subtitle|title|sentence)\b",
+    re.IGNORECASE,
+)
+
+# "in the banner" / "inside the banner" / "on the banner"...
+_IN_BANNER_HINT = re.compile(
+    r"\b(in|inside|into|within|on)\s+(the\s+|a\s+|my\s+)?(cleaned\s+)?banner\b",
+    re.IGNORECASE,
+)
+
+# Explicit placement ("at the center", "bottom of the video") - the user
+# already said where the text goes, so no clarification is needed.
+_POSITION_HINT = re.compile(
+    r"\b(center|centre|middle|top|bottom|left|right|corner)\b",
+    re.IGNORECASE,
+)
+
+
+# Answer classification for the empty-banner text-choice question.
+_IN_BANNER_ANSWER = re.compile(
+    r"\b(yes|yep|yeah|yup|sure|ok|okay|inside|in\s+the\s+banner|in\s+it|put\s+it\s+inside|on\s+the\s+banner|to\s+the\s+banner|in\s+the\s+bar|on\s+the\s+bar)\b",
+    re.IGNORECASE,
+)
+_NOT_IN_BANNER_ANSWER = re.compile(
+    r"\b(no|nope|not\s+in|dont|don\s?.t|do\s+not|center|centre|middle|outside|normal)\b",
+    re.IGNORECASE,
+)
+
+
+
+
+def _cleaned_band_for(filename):
+    """Parse the baked band (y0, y1 frame fractions) from a cleaned filename."""
+    m = re.search(r"_clean_(\d{1,4})-(\d{1,4})", filename or "")
+    if not m:
+        return None
+    y0 = int(m.group(1)) / 1000.0
+    y1 = int(m.group(2)) / 1000.0
+    if 0.0 <= y0 < y1 <= 1.001:
+        return {"y0": y0, "y1": y1}
+    return None
+
+
+
+
+def _band_banner_actions(band, text, color=None):
+    """
+    Build the action list for a "cleaned-band banner": a transparent-background
+    banner snapped exactly onto the baked band plus a text element parented to
+    it. The bar already exists in the video pixels, so the banner only exists
+    to hold the text and pin it to the band. Used both by the empty-banner
+    answer flow and the combined "hide ... replace with ..." short-circuit.
+    """
+    bid = "clean_banner"
+    text_p = {"content": text, "text": text}
+    if color:
+        text_p["color"] = color
+    return [
+        {
+            "action": "add_banner",
+            "id": bid,
+            "position": "top",
+            "properties": {
+                "x": 0.0,
+                "y": band["y0"],
+                "width": 1.0,
+                "height": band["y1"] - band["y0"],
+                "height_px": int(round((band["y1"] - band["y0"]) * 1920)),
+                "backgroundColor": "transparent",
+            },
+        },
+        {
+            "action": "add_text",
+            "properties": {
+                **text_p,
+                "parent_id": bid,
+            },
+        },
+    ]
+
+
+# "replace it WITH autoquence" / "replace the text WITH a caption": pull the
+# replacement label. The word after "with" (up to the sentence-mark / location
+# keyword) is the new text.
+_REPLACE_CLAUSE = re.compile(
+    r"\breplace\b[^.?!]{0,60}?\bwith\b\s+([^.;!?]+)",
+    re.IGNORECASE,
+)
+# Trailing words that locate rather than label the replacement text. Chained
+# ("in the banner") may leave a bare "in" after one strip, so the extractor
+# loops until stable.
+_REPLACE_TRAILER = re.compile(
+    r"\s+(in|inside|into|within|on|instead|rather|please|now|there|it"
+    r"|a\s+banner|the\s+banner|cleaned\s+banner|the\s+bar|banner|bar)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _replacement_text_for(prompt):
+    """
+    Extract the replacement label from a combined "hide/replace" prompt, e.g.
+    "hide the text above and replace it with autoquence" -> "autoquence".
+    Returns the cleaned label or None when the prompt doesn't name one.
+    """
+    user = prompt.split("\n\nContext:")[0] if "\n\nContext:" in prompt else prompt
+    m = _REPLACE_CLAUSE.search(user)
+    if not m:
+        return None
+    label = m.group(1).strip().strip("\"'")
+    # Drop trailing locative phrases ("in the banner", "on the banner", ...).
+    # Loops so a chained phrase ("in the banner" -> bare "in") is fully removed.
+    changed = True
+    while changed:
+        new_label = _REPLACE_TRAILER.sub("", label).strip()
+        changed = (new_label != label)
+        label = new_label
+    if not label:
+        return None
+    return label
+
+
+def _apply_banner_text_choice(scene, normalized, prompt):
+    """
+    The user answered the empty-banner text-choice question and wants the
+    text inside the baked banner. Build a real banner element snapped onto
+    the cleaned band with a TRANSPARENT background - the bar already exists
+    in the video pixels - and parent the text to it, so it renders and
+    sizes exactly like a normal banner text.
+    """
+    # The server prepends its own empty-banner guidance onto ``prompt``
+    # (f"{prompt}\n\nContext: ...", see the edit endpoint), and that injected
+    # text contains words which match _NOT_IN_BANNER_ANSWER — e.g. "Do NOT
+    # paint a solid banner bar" (matches "do not") and "default: center of the
+    # video" (matches "center"). Classifying the whole prompt therefore made
+    # the helper bail out on our OWN instructions, skipping the band-snap and
+    # leaving the new text flush against the video edge instead of inside the
+    # baked bar. Classify ONLY the user's actual words before the Context block.
+    user_prompt = prompt.split("\n\nContext:")[0] if "\n\nContext:" in prompt else prompt
+    if not _IN_BANNER_ANSWER.search(user_prompt):
+        return
+    if _NOT_IN_BANNER_ANSWER.search(user_prompt):
+        return
+    video = getattr(scene, "video", None)
+    filename = getattr(video, "filename", None) if video is not None else None
+    band = _cleaned_band_for(filename)
+    if not band:
+        return
+    # Harvest the requested text from whatever the planner emitted.
+    text = ""
+    color = None
+    for a in (normalized.get("plan") or {}).get("actions") or []:
+        if a.get("action") in ("add_text", "add_banner"):
+            pr = a.get("properties") or {}
+            t = (pr.get("text") or pr.get("content")
+                 or a.get("text") or a.get("content"))
+            if t:
+                text = t
+            if not color and (pr.get("text_color") or pr.get("color")):
+                color = pr.get("text_color") or pr.get("color")
+    if not text:
+        return
+    normalized["plan"]["actions"] = _band_banner_actions(band, text, color)
+
+def _scene_has_banner(scene) -> bool:
+    """True when the scene already contains a banner element."""
+    for el in getattr(scene, "elements", None) or []:
+        etype = (getattr(el, "type", "") or "").lower()
+        erole = (getattr(el, "role", "") or "").lower()
+        if "banner" in etype or "banner" in erole:
+            return True
+    return False
+
+
+def _maybe_clean_baked_banner(scene, normalized: dict, prompt: str = "") -> dict:
+    """
+    Detect + erase a baked-in banner on the scene's source video.
+
+    Mutates ``normalized`` in place: on success adds
+    ``normalized["video_swapped"]`` and swaps scene.video.filename.
+    Returns the swap info dict (or None).
+    """
+    if not _BANNER_CLEANER_OK or scene is None:
+        return None
+    video = getattr(scene, "video", None)
+    filename = getattr(video, "filename", None) if video is not None else None
+    if not filename or _cleaned_filename_for(filename):
+        return None
+
+    src = UPLOAD_FOLDER / secure_filename(filename)
+    if not src.exists():
+        return None
+
+    detection = _banner_detect_cache.get(filename)
+    if detection is None:
+        try:
+            detection = detect_white_banner(src)
+        except Exception as exc:
+            print(f"[BANNER-CLEANER] detection failed: {exc}")
+            detection = {"found": False}
+        _banner_detect_cache[filename] = detection
+
+    if not detection.get("found") or not detection.get("has_text"):
+        return None
+
+    try:
+        out = clean_if_needed(src, processed_folder=PROCESSED_FOLDER)
+    except Exception as exc:
+        print(f"[BANNER-CLEANER] clean failed: {exc}")
+        return None
+    if not out.get("cleaned"):
+        return None
+
+    cleaned_name = out["filename"]
+    swap = {
+        "from": filename,
+        "filename": cleaned_name,
+        "cleaned_url": out["cleaned_url"],
+        "region": {
+            "y0": float(detection.get("y0") or 0.0),
+            "y1": float(detection.get("y1") or 1.0),
+        },
+        "message": "Found text baked into the video's banner — removed it. Your new banner goes on clean footage.",
+    }
+
+    # Point the scene at the clean clip so the planner works on it and
+    # the client swaps the preview video to the same file.
+    try:
+        video.filename = cleaned_name
+    except Exception:
+        pass
+    normalized["video_swapped"] = swap
+    print(f"[BANNER-CLEANER] scene video swapped: {filename} -> {cleaned_name}")
+    return swap
+
+
+@app.post("/api/banner/hide-text/<filename>")
+def banner_hide_text(filename):
+    """
+    Fast endpoint for explicit "remove the text from the banner" prompts:
+    quick 4-frame detection + bake, no planner round trip.
+    """
+    if not _BANNER_CLEANER_OK:
+        return jsonify({"error": "Banner cleaner unavailable."}), 503
+    safe = secure_filename(filename)
+    src = UPLOAD_FOLDER / safe
+    if not src.exists():
+        return jsonify({"error": "Video not found."}), 404
+
+    detection = _banner_detect_cache.get(safe)
+    if detection is None:
+        try:
+            detection = detect_white_banner(src, quick=True)
+        except Exception as exc:
+            print(f"[BANNER-CLEANER] quick detection failed: {exc}")
+            detection = {"found": False}
+        _banner_detect_cache[safe] = detection
+    if not detection.get("found") or not detection.get("has_text"):
+        return jsonify({"cleaned": False, "detection": detection})
+
+    try:
+        out = clean_if_needed(src, processed_folder=PROCESSED_FOLDER)
+    except Exception as exc:
+        print(f"[BANNER-CLEANER] bake failed: {exc}")
+        return jsonify({"error": "Cleaning failed."}), 500
+    return jsonify(out)
+
+
+# ============================================================
 # AI EDIT ENDPOINT
 # ============================================================
 
@@ -974,6 +1283,134 @@ def autoquence_edit():
     try:
         scene = build_scene(scene_data)
 
+        # ── BAKED-TEXT REMOVAL SHORT-CIRCUIT ────────────────────
+        # "Remove the text from the banner" is a pixel-level op the
+        # planner cannot do (baked text is not a scene element — the
+        # planner would reply "no banners found"). When no banner
+        # element exists and a baked banner IS detected, run the
+        # cleaner directly and skip the planner entirely.
+        if (
+            _BANNER_CLEANER_OK
+            and not _scene_has_banner(scene)
+            and _HIDE_TEXT_PATTERN.search(prompt)
+        ):
+            probe = {"plan": {"actions": [], "assumptions": []}}
+            swap = _maybe_clean_baked_banner(scene, probe, prompt)
+            if swap:
+                message = (
+                    "Removed the text that was baked into your "
+                    "video's banner. The banner bar itself stays — "
+                    "you can now add your own banner on top."
+                )
+                # "hide the text ... replace it with autoquence": a combined
+                # request. Erase the baked text AND add the replacement into
+                # the same baked bar in one shot. The client executes the
+                # returned actions after swapping the clean clip in, so the
+                # new text is drawn inside the bar, not flush to the edge.
+                replacement = _replacement_text_for(prompt)
+                if replacement:
+                    band = _cleaned_band_for(swap["filename"])
+                    if band:
+                        actions = _band_banner_actions(band, replacement)
+                        probe["plan"]["actions"] = actions
+                        message = (
+                            f"Removed the text that was baked into the "
+                            f"banner and replaced it with "
+                            f"“{replacement}”."
+                        )
+                return jsonify({
+                    "response_type": "edit",
+                    "message": message,
+                    "plan": probe["plan"],
+                    "video_swapped": swap,
+                })
+            # No baked banner detected → fall through to the planner,
+            # whose "nothing found" reply is then accurate.
+
+        # EMPTY-BANNER TEXT-CHOICE CLARIFICATION
+
+        # On a cleaned clip the banner band is blank and there is no
+
+        # banner element. A bare "add a text" is ambiguous: inside the
+
+        # banner, or a normal text on the video? Ask instead of guessing.
+
+        if (
+
+            _BANNER_CLEANER_OK
+
+            and not answering_pending_question
+
+            and not _scene_has_banner(scene)
+
+            and scene.video is not None
+
+            and scene.video.filename
+
+            and _cleaned_filename_for(scene.video.filename)
+
+            and _ADD_TEXT_PATTERN.search(prompt)
+
+            and not _IN_BANNER_HINT.search(prompt)
+
+            and not _POSITION_HINT.search(prompt)
+
+        ):
+
+            return jsonify({
+
+                "response_type": "clarification",
+
+                "message": (
+
+                    "Your video has an empty banner (I removed the text "
+
+                    "that was baked into it). Do you want the new text "
+
+                    "inside the banner, or as a normal text on the video?"
+
+                ),
+
+                "intent_summary": "Asked whether new text goes in the empty banner.",
+
+                "plan": {"actions": [], "assumptions": []},
+
+            })
+
+
+
+        # The user is answering the banner text-choice question. Inject
+
+        # their decision deterministically so the planner merges it with
+
+        # the original request instead of guessing again.
+
+        if pending_question and "empty banner" in pending_question:
+
+            prompt = (
+
+                f"{prompt}\n\n"
+
+                + "Context: the video is a cleaned clip with an EMPTY banner "
+
+                "band (the original baked-in text was removed). The question "
+
+                f'asked was: "{pending_question}" The answer above '
+
+                + "decides placement: if they want the text INSIDE the banner, "
+                """Do NOT paint a solid banner bar: create the banner with """
+                """backgroundColor "transparent" so the existing baked bar shows """
+                """through, snapped onto the band (x=0, y=band top, width=1, """
+                """height=band height), and add the text parented to it via """
+                """parent_id. Otherwise create a standalone text element at """
+                """the position they asked for (default: center of the video)."""
+
+                "otherwise create a standalone text element at the position "
+
+                "they asked for (default: center of the video)."
+
+            )
+
         result = get_autoquence_ai().process(
             user_prompt=prompt,
             scene=scene,
@@ -987,6 +1424,22 @@ def autoquence_edit():
         )
 
         normalized = normalize_result(result)
+
+        # Baked-banner pass: if the source clip has banner text burned
+        # into its pixels, blank it and tell the client to load the
+        # cleaned clip before executing the plan.
+        try:
+            _maybe_clean_baked_banner(scene, normalized, prompt)
+        except Exception as e:
+            print(f"[ERROR] _maybe_clean_baked_banner failed: {e}")
+
+        # The user answered the empty-banner text-choice question:
+        # place the text directly inside the baked band (no new
+        # banner element - the bar is already in the video pixels).
+        try:
+            _apply_banner_text_choice(scene, normalized, prompt)
+        except Exception as e:
+            print(f"[ERROR] _apply_banner_text_choice failed: {e}")
 
         # The browser is the live editor source of truth. The server's
         # abstract scene is returned for debugging/context, but the browser
@@ -1569,9 +2022,19 @@ _FFMPEG_SLOTS = threading.Semaphore(
     max(1, int(os.environ.get("FFMPEG_MAX_CONCURRENT", "1")))
 )
 
-# Cap encoder threads so FFmpeg doesn't spawn one thread per CPU core
-# (multiplies memory) on a memory-constrained host.
-_FFMPEG_THREADS = max(1, min(2, os.cpu_count() or 1))
+# Encoder threads for libx264. This was previously hard-capped at 2
+# ("max(1, min(2, cpu))") to protect a 512MB RAM host — but on any real
+# multi-core machine that cap threw away most of the CPU that actually
+# drives encode speed, making exports dramatically slower than the
+# hardware allows. We now use ALL cores by default.
+#
+# A memory-constrained deploy (e.g. a 512MB box) can still pin a low value
+# with the FFMPEG_THREADS env var — libx264's per-thread memory grows with
+# resolution, so "2" is a sane choice there.
+_FFMPEG_THREADS = max(
+    1,
+    int(os.environ.get("FFMPEG_THREADS", os.cpu_count() or 1)),
+)
 
 
 def _create_export_job():
@@ -1901,6 +2364,25 @@ def edit_video(filename):
                     ),
                 )
 
+        # Cleaned-clip band offset: when the banner was snapped onto the
+
+        # blank band of a cleaned video, the client sends y_frac (band top
+
+        # as a fraction of the picture height) and the bar is drawn inside
+
+        # the band instead of flush to the frame edge.
+
+        y_frac = safe_float(item.get("y_frac"), 0.0)
+
+        y_off = (
+
+            int(round(y_frac * effective_h)) if 0.0 < y_frac < 1.0 else None
+
+        )
+        y_off = (
+            int(round(y_frac * effective_h)) if 0.0 < y_frac < 1.0 else None
+        )
+
         # Safety valve for pathological banner text: cap the number of
         # wrapped lines (the textfile drawtext can handle huge strings, but a
         # million-line banner would still be absurd). Realistic banners stay
@@ -1916,6 +2398,7 @@ def edit_video(filename):
             "font_size": chosen_fs,
             "padding": padding,
             "height": banner_h,
+            "y_off": y_off,
             "line_spacing": line_spacing,
             "bg": ffmpeg_color(
                 first_defined(
@@ -1934,6 +2417,10 @@ def edit_video(filename):
                 ),
                 "000000",
             ),
+            "transparent": str(
+                item.get("bg_color") or item.get("backgroundColor") or
+                item.get("background_color") or item.get("fill")
+            ).lower() in ("transparent", "none", "#00000000", "00"),
             "font": font,
             # Baked-in black-bar offsets are always 0 so banners sit exactly
             # on the top/bottom edge of the video — matching the preview's
@@ -1962,24 +2449,34 @@ def edit_video(filename):
         # Banners are always flush to the video edge (top_bar = 0 → top_off
         # is trivially 0), matching the preview and client export engine.
         top_off = max(0, int(banner["top_bar"] * effective_h))
+        # A cleaned-clip banner (y_off set) is drawn inside the blank band
+        # instead of flush to the edge.
+        box_y = banner["y_off"] if banner["y_off"] is not None else top_off
 
-        vf_parts.append(
-            "drawbox="
-            f"x=0:y={top_off}:w=iw:h={banner['height']}:"
-            f"color={banner['bg']}@1.0:t=fill"
-        )
+        if not banner["transparent"]:
+            vf_parts.append(
+                "drawbox="
+                f"x=0:y={box_y}:w=iw:h={banner['height']}:"
+                f"color={banner['bg']}@1.0:t=fill"
+            )
 
     for banner in bottom_geometry:
         # Banners are always flush to the video edge (bottom_bar = 0 →
         # bot_off is trivially 0), matching the preview and client engine.
         bot_off = max(0, int(banner["bottom_bar"] * effective_h))
-        y = max(0, effective_h - banner["height"] - bot_off)
+        # A cleaned-clip banner (y_off set) is drawn inside the blank band
+        # instead of flush to the edge.
+        if banner["y_off"] is not None:
+            y = banner["y_off"]
+        else:
+            y = max(0, effective_h - banner["height"] - bot_off)
 
-        vf_parts.append(
-            "drawbox="
-            f"x=0:y={y}:w=iw:h={banner['height']}:"
-            f"color={banner['bg']}@1.0:t=fill"
-        )
+        if not banner["transparent"]:
+                vf_parts.append(
+                "drawbox="
+                f"x=0:y={y}:w=iw:h={banner['height']}:"
+                f"color={banner['bg']}@1.0:t=fill"
+                )
 
     # --------------------------------------------------------
     # Banner text
@@ -2005,7 +2502,8 @@ def edit_video(filename):
         banner_text_files.append(text_file.name)
 
         top_off = max(0, int(banner["top_bar"] * effective_h))
-        y = top_off + banner["height"] / 2
+        band_top = banner["y_off"] if banner["y_off"] is not None else top_off
+        y = band_top + banner["height"] / 2
 
         font_clause = (
             f":fontfile='{ffmpeg_font_path(banner['font'])}'"
@@ -2042,7 +2540,8 @@ def edit_video(filename):
         banner_text_files.append(text_file.name)
 
         bot_off = max(0, int(banner["bottom_bar"] * effective_h))
-        y = effective_h - banner["height"] / 2 - bot_off
+        band_top = banner["y_off"] if banner["y_off"] is not None else (effective_h - banner["height"] - bot_off)
+        y = band_top + banner["height"] / 2
 
         font_clause = (
             f":fontfile='{ffmpeg_font_path(banner['font'])}'"
@@ -2370,8 +2869,8 @@ def edit_video(filename):
             "veryfast",
             "-crf",
             "20",
-            # Cap encoder threads: x264 defaults to one thread per core,
-            # which multiplies memory use. Fatal on 512MB servers.
+            # Encoder threads: using all cores unless FFMPEG_THREADS pins a
+            # lower value for a memory-constrained host (see _FFMPEG_THREADS).
             "-threads",
             str(_FFMPEG_THREADS),
             "-pix_fmt",

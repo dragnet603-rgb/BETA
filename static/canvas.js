@@ -417,7 +417,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function cssFontFamily(name) {
     if (!name) return "Arial, sans-serif";
     const base = String(name).split(",")[0].trim().replace(/['"]/g, "");
-    if (SYSTEM_FONTS.has(base)) return base;
+    if (SYSTEM_FONTS.has(base)) return base + ", Arial, sans-serif";
     return `"${base}", Arial, sans-serif`;
   }
   
@@ -898,7 +898,6 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     node.textContent = text;
-    draggable: true;
 
     // Async font reload
     ensureFont(p.fontFamily || p.font).then(() => {
@@ -1142,6 +1141,29 @@ function _renderBanner(el) {
 
   const bannerW = vr.w;
   const bannerX = vr.x;
+  // Cleaned-band banner: a banner the server created onto the baked band
+  // carries backgroundColor "transparent" and explicit y/height.
+  // Pin it to the band and shrink the text to fit, like a normal banner.
+  const isBandBanner =
+    String(bgColor || "").toLowerCase() === "transparent" &&
+    typeof el.y === "number" && typeof el.height === "number" &&
+    el.height > 0.004 && el.height < 1;
+  const bandHpx = isBandBanner ? Math.max(4, Math.round(el.height * vr.h)) : 0;
+
+  function fitLayout(reqFs) {
+    let req = reqFs;
+    let lay = layoutBannerText(text, fontFamily, fontStyle, req, el);
+    if (bandHpx > 0) {
+      let guard = 0;
+      while (Math.ceil(lay.heightOut / kOut) > bandHpx && req > 8 && guard++ < 12) {
+        const over = Math.ceil(lay.heightOut / kOut) / bandHpx;
+        req = Math.max(8, req / Math.max(1.05, over * 1.05));
+        lay = layoutBannerText(text, fontFamily, fontStyle, req, el);
+      }
+    }
+    return lay;
+  }
+
 
   // ==========================================================
   // CROPPED?
@@ -1249,12 +1271,12 @@ function _renderBanner(el) {
   // fallback, so all three renderers produce identical text.
   // ==========================================================
 
-  const L = layoutBannerText(text, fontFamily, fontStyle, REQ_FS_OUT, el);
+  const L = fitLayout(REQ_FS_OUT);
 
   const PAD = L.padOut / kOut;             // preview px
   const BASE_FS = L.fontSizeOut / kOut;    // preview px
   const textWidth = Math.max(1, bannerW - PAD * 2);
-  const bannerH = Math.max(2, Math.ceil(L.heightOut / kOut));
+  const bannerH = bandHpx > 0 ? bandHpx : Math.max(2, Math.ceil(L.heightOut / kOut));
 
   // Export payload values (output px) — consumed by _buildExportEdits.
   el._bannerFontSize = L.fontSizeOut;
@@ -1274,7 +1296,7 @@ function _renderBanner(el) {
   // pins a top banner to the very top (vr.y) and a bottom banner to the very
   // bottom (vr.y + vr.h - bannerH) — baked-in black bars are ignored, exactly
   // like the client export engine and the server FFmpeg path.
-  bannerY = bannerSnapY(isCropped, isBot, vr, bannerH);
+  bannerY = bandHpx > 0 ? (vr.y + el.y * vr.h) : bannerSnapY(isCropped, isBot, vr, bannerH);
 
   // DIAGNOSTIC — explains exactly where the banner is being painted and
   // why (remove once snapping is confirmed working).
@@ -1401,14 +1423,14 @@ function _renderBanner(el) {
     el._layoutKey = null;
     el._layout = null;
 
-    const L2 = layoutBannerText(text, cssFontFamily(rawFont), fontStyle, REQ_FS_OUT, el);
+    const L2 = fitLayout(REQ_FS_OUT);
     const PAD2 = L2.padOut / kOut;
     const FS2 = L2.fontSizeOut / kOut;
-    const bannerH2 = Math.max(2, Math.ceil(L2.heightOut / kOut));
+    const bannerH2 = bandHpx > 0 ? bandHpx : Math.max(2, Math.ceil(L2.heightOut / kOut));
 
     let by2;
 
-    by2 = bannerSnapY(isCropped, isBot, vr, bannerH2);
+    by2 = bandHpx > 0 ? (vr.y + el.y * vr.h) : bannerSnapY(isCropped, isBot, vr, bannerH2);
 
     el._bannerBaseY = by2;
     el._pixelHeight = bannerH2;
@@ -2212,10 +2234,14 @@ function _renderBanner(el) {
 
     // Position
     let ex = 0.0, ey = 0.0, ew = 1.0, eh = 0.15;
+    const hasExplicitXY = a.x !== undefined || a.y !== undefined ||
+                          p.x !== undefined || p.y !== undefined;
     if (parentId) {
       ex = 0.0; ey = 0.0; ew = 1.0; eh = 1.0; // fill parent
     } else {
-      const posPx = resolvePosition(a.position || p.position || "center");
+      // Explicit numeric coordinates beat the lossy position keyword
+      // (e.g. the server snapped the text into the baked banner band).
+      const posPx = hasExplicitXY ? null : resolvePosition(a.position || p.position || "center");
       if (posPx) { ex = posPx.x; ey = posPx.y; }
       else if (a.x !== undefined) ex = a.x;
       else if (p.x !== undefined) ex = p.x;
@@ -2223,6 +2249,14 @@ function _renderBanner(el) {
       else if (p.y !== undefined) ey = p.y;
       ew = a.width || p.width || 1.0;
       eh = a.height || p.height || 0.12;
+    }
+
+    // Fit-to-box clamp: text snapped into a baked banner band must
+    // never overflow the band rect.
+    let defFs = Math.round(outPxToPreviewPx(AQ_TYPO.text.defaultFs));
+    if (!parentId && hasExplicitXY) {
+      const boxHpx = getVideoRect().h * eh;
+      defFs = Math.max(8, Math.min(defFs, Math.round(boxHpx * 0.4)));
     }
 
     const el = {
@@ -2234,8 +2268,8 @@ function _renderBanner(el) {
         content:         txt,
         color:           a.textColor || a.text_color || p.textColor || p.text_color || p.color || (parentId ? undefined : "#ffffff"),
         // Default fontSize reduced from 28 to 16
-        fontSize:        a.fontSize  || a.font_size  || p.fontSize  || p.font_size  || 20,
-        fontFamily:      a.fontFamily|| a.font       || p.fontFamily|| p.font       || "Arial",
+        fontSize:        a.fontSize  || a.font_size  || p.fontSize  || p.font_size  || defFs,
+        fontFamily:      a.fontFamily|| a.font       || p.fontFamily|| p.font       || "Inter",
         fontWeight:      a.fontWeight|| a.font_weight|| p.fontWeight|| p.font_weight|| "bold",
         textAlign:       a.textAlign || a.alignment  || p.textAlign || p.alignment  || "center",
         backgroundColor: a.backgroundColor || a.background_color || p.backgroundColor || p.background_color || null,
@@ -2252,6 +2286,15 @@ function _renderBanner(el) {
   }
 
   // ─── add_banner ──────────────────────────────────────────────
+  // A transparent/none background signals a "cleaned-band" banner: an
+  // invisible holder that pins text to a baked bar already present in the
+  // video pixels. Shared by the integrity checks below.
+  function bgIsTransparent(bg) {
+    const s = String(bg || "").toLowerCase();
+    return s === "transparent" || s === "none" ||
+           s === "#00000000" || s === "00000000" || s === "00";
+  }
+
   function _execAddBanner(a) {
     const p        = a.properties || {};
     // "auto" is treated as "top" — the renderer snaps the banner to the
@@ -2264,10 +2307,14 @@ function _renderBanner(el) {
     const isBot    = String(position).toLowerCase().includes("bottom");
     const id       = a.id || genId(isBot ? "bot_banner" : "top_banner");
 
-    // Replace existing banner at SAME position only (not the other one)
+    // Replace existing banner at SAME position only (not the other one).
+    // NEVER remove a cleaned-band (transparent) banner — it's the invisible
+    // holder pinning text to the baked bar. Removing it would silently drop
+    // that text whenever the user adds another banner in the same slot.
     const removed = [];
     scene.elements = scene.elements.filter(e => {
       if (e.type !== "banner") return true;
+      if (bgIsTransparent(e.props?.backgroundColor ?? e.props?.bg_color)) return true;
       const bIsBot = (e.props?.position || e.role || "top").toLowerCase().includes("bottom");
       if (bIsBot === isBot) {
         removed.push(e.id);
@@ -2292,17 +2339,36 @@ function _renderBanner(el) {
     // Banner geometry: full width, thin strip at top or bottom
     const bannerH = a.height != null ? a.height : (p.height != null ? p.height : 0.1);
 
+    // Resolved banner background color (hoisted out of the object literal —
+    // a `const` declaration is not valid as an object member and will throw
+    // a SyntaxError that breaks the entire script).
+    const _reqBg = a.bgColor || a.bg_color || p.bgColor || p.bg_color || p.backgroundColor || p.background_color;
+    // A transparent/none background signals the "cleaned-band" banner: the bar
+    // already exists in the video pixels, so we must NOT substitute a solid
+    // color (that painted an unwanted bar on top of the video and broke the
+    // band-snapping logic). Treat these sentinel values like the server does
+    // (app.py middleware/list): transparent, none, #00000000, 00000000, "00".
+    const _reqBgNorm = String(_reqBg || "").toLowerCase();
+    const _isTransparentBg =
+      _reqBgNorm === "transparent" ||
+      _reqBgNorm === "none" ||
+      _reqBgNorm === "#00000000" ||
+      _reqBgNorm === "00000000" ||
+      _reqBgNorm === "00";
+
     const el = {
       id, type: "banner", role: isBot ? "bottom_banner" : "top_banner",
       parentId: null,
-      x: 0, y: isBot ? 1 - bannerH : 0,
+      x: 0, y: (a.y != null ? a.y : (p.y != null ? p.y : (isBot ? 1 - bannerH : 0))),
       width: 1, height: bannerH,
       zIndex: 100,
       props: {
         position:        isBot ? "bottom" : "top",
         text:            a.text || p.text || a.content || p.content || "",
         content:         a.text || p.text || a.content || p.content || "",
-        backgroundColor: a.bgColor || a.bg_color || p.bgColor || p.bg_color || p.backgroundColor || p.background_color || (isBot ? "#000000" : "#ffffff"),
+        backgroundColor: _isTransparentBg
+                          ? "transparent"
+                          : (_reqBg ? _reqBg : (isBot ? "#000000" : "#ffffff")),
         color:           a.textColor || a.text_color || p.textColor || p.text_color || p.color || (isBot ? "#ffffff" : "#000000"),
         fontSize:        a.fontSize || a.font_size || p.fontSize || p.font_size || Math.round(outPxToPreviewPx(AQ_TYPO.banner.defaultFs)),
         fontFamily:      a.fontFamily || a.font || p.fontFamily || p.font || "Arial",
@@ -2406,6 +2472,18 @@ function _renderBanner(el) {
     // Sync text/content
     if (el.props.text    && !el.props.content) el.props.content = el.props.text;
     if (el.props.content && !el.props.text)    el.props.text    = el.props.content;
+
+    // A banner's text is drawn by its parented text child's color (see the
+    // _renderBanner precedence: childProps.color wins over p.color). So a
+    // text-color change aimed at a banner must also land on the child —
+    // otherwise the baked-band holder shows no visible change.
+    if (el.type === "banner" && el.props.color !== undefined) {
+      const kids = scene.elements.filter(e => e.type === "text" && e.parentId === el.id);
+      for (const kid of kids) {
+        kid.props = kid.props || {};
+        kid.props.color = el.props.color;
+      }
+    }
 
     const afterSnap = JSON.stringify(el.props);
     _setRef(el.id);
@@ -2766,18 +2844,42 @@ function _renderBanner(el) {
     console.log("  message:", result.message);
     console.log("  has server scene:", !!result.scene);
 
+    // BAKED-BANNER SWAP — the server erased text burned into the video
+    // pixels and re-encoded a clean clip. Point the preview at it. The
+    // loadedmetadata listener re-syncs scene.video (filename, size,
+    // duration) automatically.
+    if (result.video_swapped && result.video_swapped.cleaned_url) {
+      const swap = result.video_swapped;
+      try {
+        const sourceEl = videoEl.querySelector("source");
+        const newUrl = swap.cleaned_url;
+        if (sourceEl) sourceEl.src = newUrl; else videoEl.src = newUrl;
+        videoEl.load();
+        console.log("  video swapped to cleaned clip:", newUrl);
+        showMsg(swap.message || "Removed text baked into the video's banner.", {
+          type: "success", ms: 5000,
+        });
+      } catch (e) {
+        console.warn("  video swap failed:", e);
+      }
+    }
+
     // Clarifications / conversations / crop choices need user input → keep them visible.
     // Results with NO actions (misclassified vague prompts) also stay visible.
     // Successful edit confirmations are deferred until the animations finish
     // (the canvas itself is the progress UI while the edit plays out).
     const actions = result?.plan?.actions || result?.actions || [];
+    const isSwap = !!result.video_swapped;
     const needsInput =
-      result.response_type === "clarification" ||
-      result.response_type === "conversation" ||
-      result.response_type === "crop_choice" ||
-      actions.length === 0;
+      !isSwap && (
+        result.response_type === "clarification" ||
+        result.response_type === "conversation" ||
+        result.response_type === "crop_choice" ||
+        actions.length === 0
+      );
 
-    const isEdit = result.response_type === "edit" && actions.length > 0;
+    const isEdit =
+      (result.response_type === "edit" && actions.length > 0) || isSwap;
     const showResultMsg = () => {
       if (!result.message) return;
       showMsg(result.message, {
@@ -2798,7 +2900,7 @@ function _renderBanner(el) {
       pendingQuestion = result.message || "";
     } else if (result.response_type === "conversation") {
       pendingQuestion = (result.message || "").trim().endsWith("?") ? result.message : null;
-    } else if (actions.length > 0) {
+    } else if (actions.length > 0 || isSwap) {
       pendingQuestion = null;
     }
 
@@ -3380,6 +3482,9 @@ function _renderBanner(el) {
         h: bgNode ? bgNode.height() : grp.height(),
         position: ((el.props && el.props.position) || "top"),
         dragOffsetY: el._dragOffsetY || 0,
+        // Cleaned-band banner: expose the explicit band y so the export
+        // engine can pin it to the baked band.
+        yFrac: (String((((el.props || {}).backgroundColor) || "").toLowerCase() === "transparent" && typeof el.y === "number") ? el.y : null),
       };
     },
     // Baked-in letterbox bars of the SOURCE pixels (fractions of visible
@@ -3616,6 +3721,9 @@ function _renderBanner(el) {
           y: el.y || 0,
           w: 1,
           h: el.height || 0.1,
+          // Cleaned-band banner: send the band top so FFmpeg draws the
+          // text inside the baked band (no box is drawn for transparent).
+          y_frac: (String(p.backgroundColor||"").toLowerCase() === "transparent" ? (el.y || 0) : 0),
           // Banner height as a fraction of the picture height (see above).
           height_frac:   heightFrac,
           // Legacy output-px value (kept for old servers / debugging).
