@@ -20,6 +20,19 @@ body {
   border-radius: 14px;
 }
 
+/* Anti-flash: the card stays invisible until auth.js proves there is no
+   auto-restorable Firebase session (or a safety timeout fires). Prevents
+   the sign-in UI flashing before the automatic login redirect. */
+#loginCard {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease-out;
+}
+#loginCard.ready {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 #loginCard h1 {
   margin: 0 0 4px;
   font-size: 26px;

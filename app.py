@@ -30,6 +30,8 @@ except ImportError as _bce:
     print(f"[BANNER-CLEANER] module unavailable: {_bce}")
     _BANNER_CLEANER_OK = False
 
+import modal_ffmpeg_client  # noqa: E402  (cloud-GPU export proxy + local fallback)
+
 
 # ============================================================
 # AUTOQUENCE APP
@@ -734,7 +736,11 @@ def index():
 
 @app.route("/canvas/<filename>")
 def canvas_page(filename):
-    return render_template("canvas.html", filename=filename)
+    return render_template(
+        "canvas.html",
+        filename=filename,
+        cloud_export_enabled=modal_ffmpeg_client.modal_configured(),
+    )
 
 
 # ============================================================
@@ -1074,6 +1080,32 @@ def _scene_has_banner(scene) -> bool:
     return False
 
 
+def _detect_baked_banner(filename):
+    """
+    Cached baked-banner detection for an uploaded clip. Returns the
+    detection dict only when a banner with text was found, else None.
+    Detection samples a dozen frames and is not cheap, so each upload is
+    analyzed only once per process.
+    """
+    if not _BANNER_CLEANER_OK or not filename or _cleaned_filename_for(filename):
+        return None
+    detection = _banner_detect_cache.get(filename)
+    if detection is None:
+        src = UPLOAD_FOLDER / secure_filename(filename)
+        if not src.exists():
+            detection = {"found": False}
+        else:
+            try:
+                detection = detect_white_banner(src)
+            except Exception as exc:
+                print(f"[BANNER-CLEANER] detection failed: {exc}")
+                detection = {"found": False}
+        _banner_detect_cache[filename] = detection
+    if detection.get("found") and detection.get("has_text"):
+        return detection
+    return None
+
+
 def _maybe_clean_baked_banner(scene, normalized: dict, prompt: str = "") -> dict:
     """
     Detect + erase a baked-in banner on the scene's source video.
@@ -1093,16 +1125,8 @@ def _maybe_clean_baked_banner(scene, normalized: dict, prompt: str = "") -> dict
     if not src.exists():
         return None
 
-    detection = _banner_detect_cache.get(filename)
+    detection = _detect_baked_banner(filename)
     if detection is None:
-        try:
-            detection = detect_white_banner(src)
-        except Exception as exc:
-            print(f"[BANNER-CLEANER] detection failed: {exc}")
-            detection = {"found": False}
-        _banner_detect_cache[filename] = detection
-
-    if not detection.get("found") or not detection.get("has_text"):
         return None
 
     try:
@@ -1327,6 +1351,60 @@ def autoquence_edit():
             # No baked banner detected → fall through to the planner,
             # whose "nothing found" reply is then accurate.
 
+        # BAKED-TEXT ADD-TEXT CLARIFICATION
+        # The clip still has its original baked-in banner text. A bare
+        # "add a text" is ambiguous: erase the baked text first (and put
+        # the new text inside the banner), or keep the baked text and just
+        # add a normal text? Ask instead of silently blanking the video.
+        if (
+            _BANNER_CLEANER_OK
+            and not answering_pending_question
+            and not _scene_has_banner(scene)
+            and scene.video is not None
+            and scene.video.filename
+            and _ADD_TEXT_PATTERN.search(prompt)
+            and not _HIDE_TEXT_PATTERN.search(prompt)
+            and not _REPLACE_CLAUSE.search(prompt)
+            and not _POSITION_HINT.search(prompt)
+            and _detect_baked_banner(scene.video.filename) is not None
+        ):
+            return jsonify({
+                "response_type": "clarification",
+                "message": (
+                    "Your video has text baked into its banner. Do you want "
+                    "me to erase it first — leaving an empty banner — and put "
+                    "your new text inside the banner, or keep the baked text "
+                    "and just add a normal text on the video?"
+                ),
+                "intent_summary": "Asked whether to erase baked banner text before adding new text.",
+                "plan": {"actions": [], "assumptions": []},
+            })
+
+        # ANSWER to the baked-text question above. If the user wants the
+        # baked text erased, run the cleaner NOW (before the planner) so
+        # the plan is built against the cleaned clip — the existing
+        # empty-banner Context injection then snaps the new text into
+        # the band automatically.
+        if (
+            _BANNER_CLEANER_OK
+            and answering_pending_question
+            and pending_question
+            and "baked into its banner" in pending_question
+            and not _scene_has_banner(scene)
+            and scene.video is not None
+            and scene.video.filename
+            and not _cleaned_filename_for(scene.video.filename)
+            and _IN_BANNER_ANSWER.search(prompt)
+            and not _NOT_IN_BANNER_ANSWER.search(prompt)
+        ):
+            probe = {"plan": {"actions": [], "assumptions": []}}
+            swap = _maybe_clean_baked_banner(scene, probe, prompt)
+            if swap:
+                print(
+                    f"[BANNER-CLEANER] erased baked text on user confirmation: "
+                    f"{swap['from']} -> {swap['filename']}"
+                )
+
         # EMPTY-BANNER TEXT-CHOICE CLARIFICATION
 
         # On a cleaned clip the banner band is blank and there is no
@@ -1385,7 +1463,11 @@ def autoquence_edit():
 
         # the original request instead of guessing again.
 
-        if pending_question and "empty banner" in pending_question:
+        if (
+            pending_question and "empty banner" in pending_question
+            and scene.video is not None and scene.video.filename
+            and _cleaned_filename_for(scene.video.filename)
+        ):
 
             prompt = (
 
@@ -1425,13 +1507,17 @@ def autoquence_edit():
 
         normalized = normalize_result(result)
 
-        # Baked-banner pass: if the source clip has banner text burned
-        # into its pixels, blank it and tell the client to load the
-        # cleaned clip before executing the plan.
-        try:
-            _maybe_clean_baked_banner(scene, normalized, prompt)
-        except Exception as e:
-            print(f"[ERROR] _maybe_clean_baked_banner failed: {e}")
+        # Baked-banner pass: ONLY when the user actually asked to remove or
+        # replace text ("remove the text in the banner", "replace it with
+        # X"). A plain "add a text" must never silently erase the user's
+        # baked-in banner text — that case is handled by the clarification
+        # above instead.
+        user_words = prompt.split("\n\nContext:")[0] if "\n\nContext:" in prompt else prompt
+        if _HIDE_TEXT_PATTERN.search(user_words) or _REPLACE_CLAUSE.search(user_words):
+            try:
+                _maybe_clean_baked_banner(scene, normalized, prompt)
+            except Exception as e:
+                print(f"[ERROR] _maybe_clean_baked_banner failed: {e}")
 
         # The user answered the empty-banner text-choice question:
         # place the text directly inside the baked band (no new
@@ -2080,10 +2166,9 @@ def edit_video(filename):
     if not isinstance(raw_edits, list):
         return jsonify({"error": "edits must be an array."}), 400
 
-    safe_name = safe_filename(filename)
-    input_path = UPLOAD_FOLDER / safe_name
+    input_path = _resolve_media_file(filename)
 
-    if not input_path.exists():
+    if input_path is None:
         return jsonify({"error": "Input video not found."}), 404
 
     try:
@@ -3041,6 +3126,22 @@ def export_status(job_id):
     return jsonify(job)
 
 
+def _resolve_media_file(filename):
+    """Locate a source video by name.
+
+    Normally it lives in UPLOAD_FOLDER, but after a baked-banner cleanup the
+    browser preview (and therefore getFilename()) points at the cleaned
+    re-encode in PROCESSED_FOLDER -- export endpoints must accept both, since
+    the plate geometry is computed against whatever the preview shows.
+    """
+    safe_name = safe_filename(filename)
+    for folder in (UPLOAD_FOLDER, PROCESSED_FOLDER):
+        candidate = folder / safe_name
+        if candidate.exists():
+            return candidate
+    return None
+
+
 # ============================================================
 # CLIENT-EXPORT UPLOAD
 #
@@ -3053,10 +3154,9 @@ def export_status(job_id):
 
 @app.post("/export/upload/<filename>")
 def export_upload(filename):
-    input_name = safe_filename(filename)
-    input_path = UPLOAD_FOLDER / input_name
+    input_path = _resolve_media_file(filename)
 
-    if not input_path.exists():
+    if input_path is None:
         return jsonify({"error": "Unknown source video."}), 404
 
     file = request.files.get("file")
@@ -3077,6 +3177,68 @@ def export_upload(filename):
 
     print("[Autoquence] Client export saved:", output_path)
     return jsonify({"output_file": output_filename})
+
+
+# ============================================================
+# CLOUD-GPU (MODAL) EXPORT
+#
+# The browser renders every non-video element once into a transparent
+# overlay plate (export-engine.js buildOverlayPlate) and POSTs it here with
+# the geometry. This endpoint combines plate + source and sends both to a
+# serverless NVIDIA GPU (Modal) which does crop->fit->overlay->NVENC encode.
+# Falls back to local rendering (NVENC if present, else x264) automatically
+# via modal_ffmpeg_client.render_export, so Modal absence never breaks export.
+# Uses the same _export_jobs store so /export/status and /download work
+# unchanged.
+# ============================================================
+
+@app.post("/export/modal/<filename>")
+def export_modal(filename):
+    input_path = _resolve_media_file(filename)
+
+    if input_path is None:
+        return jsonify({"error": "Input video not found."}), 404
+
+    geom_json = request.form.get("geom")
+    if not geom_json:
+        return jsonify({"error": "Missing 'geom' form field."}), 400
+    try:
+        geom = json.loads(geom_json)
+    except Exception:
+        return jsonify({"error": "Invalid 'geom' JSON."}), 400
+
+    plate = request.files.get("plate")
+    if plate is None or not plate.filename:
+        return jsonify({"error": "Missing 'plate' file field."}), 400
+    plate_bytes = plate.read()
+
+    output_filename = safe_filename(f"{input_path.stem}_edited.mp4")
+    output_path = OUTPUT_FOLDER / output_filename
+
+    _stats.log_event(session.get("email", ""), session.get("uid", ""), "export_started", filename)
+
+    job_id = _create_export_job()
+
+    def _modal_worker():
+        _FFMPEG_SLOTS.acquire()
+        try:
+            modal_ffmpeg_client.export_with_plate(
+                str(input_path), plate_bytes, geom, str(output_path)
+            )
+            _update_export_job(
+                job_id, status="done", progress=100.0, output_file=output_filename
+            )
+            _stats.log_event("", "", "export_completed", output_filename)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            _update_export_job(job_id, status="error", error=str(exc))
+        finally:
+            _FFMPEG_SLOTS.release()
+
+    threading.Thread(target=_modal_worker, daemon=True).start()
+
+    return jsonify({"status": "started", "job_id": job_id})
 
 
 # ============================================================

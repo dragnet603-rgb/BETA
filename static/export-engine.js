@@ -613,6 +613,52 @@
     return { under: under, over: over };
   }
 
+  // Overlay plate for the cloud-GPU (Modal) export path.
+  //
+  // Renders EVERYTHING except the video and the letterbox background onto a
+  // single TRANSPARENT 1080x1920 canvas, exactly like a single frame would
+  // composite for the client path — but as one static image. Shapes, banners
+  // and free text are baked in at output resolution using the same fit math
+  // (geom.offX/offY/placedW/placedH) as buildStaticLayers, so the plate lines
+  // up with the GPU's pad/letterbox when overlaid full-frame. Server-side
+  // ffmpeg only has to layer this one PNG over the padded video + encode.
+  function buildOverlayPlate(state) {
+    const geom = state.geom;
+    const canvas = document.createElement("canvas");
+    canvas.width = geom.width;
+    canvas.height = geom.height;
+    const ctx = canvas.getContext("2d");
+
+    const plan = state.plan;
+    const assets = state.assets;
+
+    // Under-layer: shapes / images below banners (transparent, no bg).
+    for (const op of plan.underLayer) {
+      if (op.kind === "shape") drawShapeOp(ctx, op);
+      else drawImageOp(ctx, op, plan.imgCache);
+    }
+
+    // Banners (Konva snapshots pinned to the video edges like buildStaticLayers).
+    const bars = state.bars || { top: 0, bottom: 0 };
+    if (assets.banners && assets.banners.length) {
+      for (const op of placeBannerOps(geom, assets.banners, bars)) {
+        ctx.drawImage(op.canvas, op.x, op.y, op.w, op.h);
+      }
+    } else if (plan.hasBanners && assets.snapshot) {
+      const a = geom.anchor;
+      const destX = geom.offX - a.x * geom.scale;
+      const destY = geom.offY - a.y * geom.scale;
+      const destW = (assets.snapshot.width / assets.snapshotPr) * geom.scale;
+      const destH = (assets.snapshot.height / assets.snapshotPr) * geom.scale;
+      ctx.drawImage(assets.snapshot, destX, destY, destW, destH);
+    }
+
+    // Over-layer: free text above everything.
+    for (const op of plan.overLayer) drawTextOp(ctx, op);
+
+    return canvas;
+  }
+
   function drawComposite(ctx, plan, snapshot, snapshotPr, geom, sourceEl, staticLayers) {
     const W = geom.width, H = geom.height;
 
@@ -1068,6 +1114,62 @@
   }
 
   // ─────────────────────────────────────────────────────────────
+  // Cloud-GPU (Modal) export: build the overlay plate + server geometry.
+  //
+  // Mirrors the state assembly in exportScene() (used by the in-browser
+  // path) so the plate uses the exact same fit math, then returns a
+  // transparent PNG canvas PLUS the geom/timeline the server needs to
+  // composite it over the video on the GPU.
+  // ─────────────────────────────────────────────────────────────
+  async function buildCloudPlate(options) {
+    const bridge = window.__AQ_CANVAS_BRIDGE__;
+    if (!bridge) throw new Error("Canvas bridge is not initialized.");
+
+    const scene = bridge.getScene();
+    const mainVideo = bridge.getVideoEl();
+    if (!mainVideo || !mainVideo.currentSrc) throw new Error("No video loaded.");
+    if (!mainVideo.videoWidth) await waitForEvent(mainVideo, "loadedmetadata", 15000);
+
+    const duration = Number.isFinite(mainVideo.duration)
+      ? mainVideo.duration
+      : (scene.video.duration || 0);
+    if (!(duration > 0)) throw new Error("Could not determine video duration.");
+
+    const geom = computeOutput(bridge, scene, {
+      videoWidth: mainVideo.videoWidth,
+      videoHeight: mainVideo.videoHeight,
+    });
+    const tl = computeTimeline(scene, duration);
+    const assets = await prepareAssets(bridge, scene, geom);
+
+    const state = {
+      bridge, scene, geom, tl,
+      videoUrl: mainVideo.currentSrc,
+      plan: buildDrawPlan(bridge, scene, geom),
+      assets,
+      bars: (bridge.contentBars && bridge.contentBars()) || { top: 0, bottom: 0 },
+    };
+    state.plan.imgCache = assets.imgCache;
+
+    const canvas = buildOverlayPlate(state);
+
+    // The bitrate used by the in-browser path; handed to the GPU encoder.
+    const bitrate = Math.round(clamp(geom.width * geom.height * FPS * 0.12, 8000000, 24000000));
+
+    const serverGeom = {
+      width: geom.width,
+      height: geom.height,
+      srcRect: geom.srcRect,
+      trim: { start: tl.start, end: tl.end },
+      speed: tl.speed,
+      bitrate: bitrate,
+      bg: scene.canvas.background || "#000000",
+    };
+
+    return { canvas: canvas, geom: serverGeom };
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // Public entry
   // ─────────────────────────────────────────────────────────────
   async function exportScene(options) {
@@ -1144,6 +1246,10 @@
 
   window.__AQ_CLIENT_EXPORT__ = {
     exportScene: exportScene,
+    // Cloud-GPU (Modal) path: build a transparent overlay plate + server geom.
+    // Returns a Promise<{ canvas, geom }>. Upload the canvas as PNG with the
+    // geom JSON to POST /export/modal/<filename>.
+    buildCloudPlate: buildCloudPlate,
     isSupported: function () {
       return !!window.__AQ_CANVAS_BRIDGE__ &&
              typeof window.Mp4Muxer !== "undefined" &&

@@ -183,13 +183,56 @@ function initLoginPage() {
 
   // Already signed in with Firebase (e.g. revisiting the page)
   // -> refresh the server session and continue into the app.
-  if (!auth) return;
+  //
+  // Anti-flash: #loginCard is hidden (opacity 0) until we know the user
+  // is NOT auto-signed-in. If Firebase restores a session we keep it
+  // hidden and show "Signing you in…" while re-minting the cookie, so a
+  // signed-in revisit never flashes the full sign-in form.
+  const card = document.getElementById("loginCard");
+  let revealed = false;
+  const reveal = () => {
+    if (revealed || !card) return;
+    revealed = true;
+    card.classList.add("ready");
+  };
+
+  if (!auth) {
+    // Firebase unavailable (blocked CDN / no config): show the form now.
+    reveal();
+    return;
+  }
+
+  // Safety net: if the auth-state callback never fires (very slow CDN,
+  // hung network), always reveal the form eventually.
+  setTimeout(reveal, 3000);
+
   onAuthStateChanged(auth, (user) => {
     if (user) {
+      if (!revealed) {
+        // The card (and its #authStatus) is still hidden — show the
+        // status outside the card so the user sees feedback while the
+        // session is re-minted.
+        const auto =
+          document.getElementById("autoStatus") ||
+          Object.assign(document.body.appendChild(document.createElement("div")), {
+            id: "autoStatus",
+            className: "authStatus",
+          });
+        auto.style.cssText =
+          "display:block;position:fixed;inset:auto 0 40vh 0;text-align:center;color:#9aa3b2;font:500 15px system-ui";
+        auto.textContent = "Signing you in…";
+      }
       user
         .getIdToken()
         .then(sessionSignIn)
-        .catch(() => {}); // fall back to manual sign-in
+        .catch(() => {
+          // Auto sign-in failed (revoked token, network): fall back to
+          // the manual sign-in form.
+          document.getElementById("autoStatus")?.remove();
+          reveal();
+        });
+    } else {
+      reveal();
     }
   });
 }

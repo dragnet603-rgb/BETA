@@ -120,6 +120,12 @@
          unpkg — removes a cross-origin DNS/redirect round trip and a
          third-party availability risk for the whole editor. -->
     <script src="{{ static_v('vendor/konva.min.js') }}" defer></script>
+    <!-- Cloud-GPU (Modal) export: the browser builds a transparent overlay
+         plate and a serverless GPU re-encodes; enabled only when the server
+         has MODAL_WEB_URL configured. -->
+    <script>
+      window.__AQ_CLOUD_EXPORT_ENABLED__ = {{ 'true' if cloud_export_enabled else 'false' }};
+    </script>
     <!-- Client-side export engine: renders the canvas composition itself
          (WebCodecs/MediaRecorder) instead of server-side FFmpeg, so the
          exported file matches the preview pixel-for-pixel. -->

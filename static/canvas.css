@@ -51,7 +51,7 @@ right: 3vw;
 width: 15vw;
 max-width: 120px;
 background: rgb(66, 63, 63);
-border: 2px solid white;
+
 border-radius: 20px;
 display: flex;
 justify-content: center;
@@ -577,6 +577,36 @@ transform: translateX(18px);
   filter: blur(4px) brightness(0.78);
   transition: filter 0.35s ease;
 }
+/* ── Standalone text: bounding frame + corner resize handle ── */
+/* The text node (.aq-text) is display:flex; frame/handle are absolutely
+   positioned children so they never participate in the flex layout. */
+.aq-text-inner {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  white-space: pre-wrap;
+}
+.aq-text-frame {
+  position: absolute;
+  border: 1.5px solid yellowgreen;
+  border-radius: 6px;
+  background: rgba(90, 156, 255, 0.06);
+  pointer-events: none;
+  z-index: 1;
+}
+.aq-text-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 2px solid yellowgreen;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  cursor: nwse-resize;
+  pointer-events: auto;
+  z-index: 2;
+}
+
 /* #konvaStage is now a sibling of .canvas — select it via .canvas-container */
 .canvas.processing ~ #konvaStage {
   filter: blur(4px) brightness(0.78);
@@ -750,7 +780,7 @@ backdrop-filter: blur(4px);
 }
 #exportCard {
 background: #1a1a1a;
-border: 1px solid #2a2a2a;
+
 border-radius: 16px;
 padding: 40px 48px;
 display: flex;

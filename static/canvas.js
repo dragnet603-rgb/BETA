@@ -856,6 +856,10 @@ document.addEventListener("DOMContentLoaded", () => {
       domNodes.set(el.id, node);
       _makeDraggable(node, el);
     }
+    // Inner span + bounding frame + corner handle. Self-healing: the
+    // typewriter animations write raw text into the node (wiping these
+    // children), so recreate them whenever they are missing.
+    const { span, frame, handle } = _ensureTextChildren(node, el);
 
     const fontFamily = cssFontFamily(p.fontFamily || p.font || "Arial");
     // Default font size reduced to 16px — was 28px which was too large
@@ -897,12 +901,123 @@ document.addEventListener("DOMContentLoaded", () => {
       justifyContent: textAlign === "center" ? "center" : (textAlign === "right" ? "flex-end" : "flex-start"),
     });
 
-    node.textContent = text;
+    if (span) {
+      span.textContent = text;
+    }
 
     // Async font reload
     ensureFont(p.fontFamily || p.font).then(() => {
       node.style.fontFamily = cssFontFamily(p.fontFamily || p.font);
+      _updateTextFrame(node, span, frame, handle);
     });
+
+    // Position the bounding frame after the new styles/layout settle.
+    requestAnimationFrame(() => _updateTextFrame(node, span, frame, handle));
+  }
+
+  // ── Text bounding frame helpers ──────────────────────────────
+  // The frame hugs the shrink-to-fit text span with fixed padding and
+  // stretches with the text. It lives INSIDE the draggable text node, so
+  // moving the text moves the frame (and handle) for free.
+  const _TEXT_FRAME_PAD = 8;
+  const _HANDLE_SIZE = 14;
+
+  // (Re)create the inner span + frame + handle. The typewriter animations
+  // write raw text into the node, wiping these children — so this runs on
+  // every render and rebuilds whatever is missing.
+  function _ensureTextChildren(node, el) {
+    let span = node.querySelector(":scope > .aq-text-inner");
+    if (!span) {
+      // Remove stray raw text nodes left behind by the typewriter.
+      [...node.childNodes].forEach((n) => {
+        if (n.nodeType === Node.TEXT_NODE) n.remove();
+      });
+      span = document.createElement("span");
+      span.className = "aq-text-inner";
+      node.insertBefore(span, node.firstChild);
+    }
+    let frame = node.querySelector(":scope > .aq-text-frame");
+    let handle = node.querySelector(":scope > .aq-text-handle");
+    if (!el.parentId) {
+      if (!frame) {
+        frame = document.createElement("div");
+        frame.className = "aq-text-frame";
+        frame.style.pointerEvents = "none";
+        node.appendChild(frame);
+      }
+      if (!handle) {
+        handle = document.createElement("div");
+        handle.className = "aq-text-handle";
+        node.appendChild(handle);
+        _makeTextResizable(handle, node, el);
+      }
+    }
+    return { span, frame, handle };
+  }
+
+  function _updateTextFrame(node, span, frame, handle) {
+    if (!node || !span || !frame || !handle) return;
+    // span's offset* is relative to the node (its offsetParent).
+    const l = span.offsetLeft - _TEXT_FRAME_PAD;
+    const t = span.offsetTop - _TEXT_FRAME_PAD;
+    const w = span.offsetWidth + _TEXT_FRAME_PAD * 2;
+    const h = span.offsetHeight + _TEXT_FRAME_PAD * 2;
+    frame.style.left = `${l}px`;
+    frame.style.top = `${t}px`;
+    frame.style.width = `${w}px`;
+    frame.style.height = `${h}px`;
+    handle.style.left = `${l + w - _HANDLE_SIZE / 2}px`;
+    handle.style.top = `${t + h - _HANDLE_SIZE / 2}px`;
+  }
+
+  // Bottom-right circle handle: drag OUT to make the text bigger, IN to
+  // make it smaller. Scales fontSize by the pointer's distance from the
+  // node center, so the box grows/shrinks symmetrically under the cursor.
+  function _makeTextResizable(handle, node, el) {
+    let startFs = 0, startDist = 0, raf = null;
+
+    function center() {
+      const r = node.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }
+    function distTo(x, y) {
+      const c = center();
+      return Math.hypot(x - c.x, y - c.y);
+    }
+    function resizeStart(clientX, clientY) {
+      if (window.AQAnim && window.AQAnim.hasActive()) _cancelAnimations();
+      startFs = Number(el.props.fontSize) || outPxToPreviewPx(AQ_TYPO.text.defaultFs);
+      startDist = Math.max(4, distTo(clientX, clientY));
+    }
+    function resizeMove(clientX, clientY) {
+      const scale = distTo(clientX, clientY) / startDist;
+      const fs = Math.max(8, Math.min(96, Math.round(startFs * scale)));
+      if (fs === el.props.fontSize) return;
+      el.props.fontSize = fs;
+      if (!raf) {
+        raf = requestAnimationFrame(() => { raf = null; renderElements(); });
+      }
+    }
+
+    handle.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      resizeStart(e.clientX, e.clientY);
+      function onMove(ev) { resizeMove(ev.clientX, ev.clientY); }
+      function onUp() { document.removeEventListener("mousemove", onMove); document.removeEventListener("mouseup", onUp); }
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    handle.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      resizeStart(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: false });
+    handle.addEventListener("touchmove", (e) => {
+      e.preventDefault();
+      resizeMove(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: false });
   }
 
   // ============================================================
@@ -918,7 +1033,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // "Middle" caption size at 1080-wide output — readable, not chunky.
     banner: { defaultFs: 56, minFs: 24, lineHeight: 1.15,
               padFrac: 0.45, minPad: 10, capFrac: 0.4 },
-    text:   { defaultFs: 34, lineHeight: 1.25, pad: 8 },
+    text:   { defaultFs: 26, maxFs: 40, lineHeight: 1.25, pad: 8 },
   };
   window.__AQ_TYPO__ = AQ_TYPO;
 
@@ -1839,7 +1954,8 @@ function _renderBanner(el) {
           kind: "dom",
           left: cs.left, top: cs.top, width: cs.width, height: cs.height,
           fontSize: cs.fontSize, opacity: cs.opacity,
-          text: node.textContent,   // for ChatGPT-style text reveal diffs
+          text: (node.querySelector(":scope > .aq-text-inner") || node).textContent,
+          // for ChatGPT-style text reveal diffs
         };
         continue;
       }
@@ -1920,7 +2036,10 @@ function _renderBanner(el) {
     if (node) {
       const el = byId(id);
       const isText = !!(el && el.type === "text");
-      const fullText = isText ? String(node.textContent || "") : "";
+      // Type into the inner span (never the node — writing node.textContent
+      // would wipe the bounding frame + resize handle children).
+      const typeTarget = (isText && node.querySelector(":scope > .aq-text-inner")) || node;
+      const fullText = isText ? String(typeTarget.textContent || "") : "";
       const typeMs = isText && fullText ? _typeDuration(fullText) : 0;
 
       const targetOpacity = parseFloat(getComputedStyle(node).opacity || "1");
@@ -1928,7 +2047,7 @@ function _renderBanner(el) {
       node.style.transformOrigin = "center center";
       node.style.opacity = "0";
       if (typeMs) {
-        node.textContent = "";            // will be typed in character-by-character
+        typeTarget.textContent = "";            // will be typed in character-by-character
       } else {
         node.style.transform = "scale(0.85)";
       }
@@ -1939,7 +2058,7 @@ function _renderBanner(el) {
           // Quick fade-in (first quarter), then pure typing.
           node.style.opacity = String(Math.min(1, v * (typeMs ? 4 : 1)) * targetOpacity);
           if (typeMs) {
-            node.textContent = fullText.slice(0, Math.ceil(v * fullText.length));
+            typeTarget.textContent = fullText.slice(0, Math.ceil(v * fullText.length));
           } else {
             node.style.transform = `scale(${0.85 + 0.15 * v})`;
           }
@@ -2066,7 +2185,10 @@ function _renderBanner(el) {
       // (e.g. change_text). The node currently holds the FINAL text;
       // pin the old text and reveal the new one character-by-character.
       const beforeText = before.text != null ? String(before.text) : null;
-      const curText = String(node.textContent || "");
+      // Type into the inner span (never the node — writing node.textContent
+      // would wipe the bounding frame + resize handle children).
+      const typeTarget = (node.querySelector(":scope > .aq-text-inner")) || node;
+      const curText = String(typeTarget.textContent || "");
       const textChanged = beforeText !== null && curText !== beforeText;
       const typeMs = textChanged ? _typeDuration(curText) : 0;
 
@@ -2074,7 +2196,7 @@ function _renderBanner(el) {
 
       // Pin at the pre-action visuals
       for (const k of Object.keys(from)) node.style[k] = before[k];
-      if (textChanged) node.textContent = beforeText;
+      if (textChanged) typeTarget.textContent = beforeText;
 
       window.AQAnim.tween({
         duration: Math.max(380, typeMs),
@@ -2084,7 +2206,7 @@ function _renderBanner(el) {
             node.style[k] = (from[k] + (toV[k] - from[k]) * v) + (PX.has(k) ? "px" : "");
           }
           if (textChanged) {
-            node.textContent = curText.slice(0, Math.ceil(v * curText.length));
+            typeTarget.textContent = curText.slice(0, Math.ceil(v * curText.length));
           }
         },
         onComplete() { const e2 = byId(id); if (e2) _renderElement(e2); done(); },
@@ -2259,6 +2381,15 @@ function _renderBanner(el) {
       defFs = Math.max(8, Math.min(defFs, Math.round(boxHpx * 0.4)));
     }
 
+    // Standalone (non-banner) text stays small: the planner tends to emit
+    // chunky sizes (48/56 — its own few-shot examples), so clamp whatever
+    // it sends to AQ_TYPO.text.maxFs. Banner-parented text is untouched.
+    let fs = a.fontSize || a.font_size || p.fontSize || p.font_size || defFs;
+    if (!parentId) {
+      const maxFs = Math.round(outPxToPreviewPx(AQ_TYPO.text.maxFs));
+      fs = Math.min(fs, maxFs);
+    }
+
     const el = {
       id: id, type: "text", role: a.role || p.role || "text",
       parentId, x: ex, y: ey, width: ew, height: eh,
@@ -2267,8 +2398,7 @@ function _renderBanner(el) {
         text:            txt,
         content:         txt,
         color:           a.textColor || a.text_color || p.textColor || p.text_color || p.color || (parentId ? undefined : "#ffffff"),
-        // Default fontSize reduced from 28 to 16
-        fontSize:        a.fontSize  || a.font_size  || p.fontSize  || p.font_size  || defFs,
+        fontSize:        fs,
         fontFamily:      a.fontFamily|| a.font       || p.fontFamily|| p.font       || "Inter",
         fontWeight:      a.fontWeight|| a.font_weight|| p.fontWeight|| p.font_weight|| "bold",
         textAlign:       a.textAlign || a.alignment  || p.textAlign || p.alignment  || "center",
@@ -3588,7 +3718,49 @@ function _renderBanner(el) {
       // ── Preferred path: render in the BROWSER from the exact canvas
       //    composition (WYSIWYG), then upload the encoded file.
       const engine = window.__AQ_CLIENT_EXPORT__;
-      if (engine && engine.isSupported()) {
+      // Cloud-GPU (Modal) path: same canvas-exact plate, but the browser only
+      // renders ONE transparent overlay frame and a serverless GPU does the
+      // heavy encode. Enabled when the server flags MODAL_WEB_URL.
+      const useCloud = engine && typeof engine.buildCloudPlate === "function" &&
+                       window.__AQ_CLOUD_EXPORT_ENABLED__;
+      if (useCloud) {
+        exportPath = "cloud";
+        if (label) label.textContent = "Rendering plate…";
+        const { canvas: plateCanvas, geom: plateGeom } = await engine.buildCloudPlate();
+
+        if (label) label.textContent = "Exporting video…";
+        setProgress(10);
+        const pngBlob = await new Promise((res) => plateCanvas.toBlob(res, "image/png"));
+        if (!pngBlob) throw new Error("Could not rasterize overlay plate.");
+
+        const fd = new FormData();
+        fd.append("plate", pngBlob, "plate.png");
+        fd.append("geom", JSON.stringify(plateGeom));
+
+        const startRes = await fetch(`/export/modal/${getFilename()}`, { method: "POST", body: fd });
+        if (!startRes.ok) {
+          let detail = startRes.statusText;
+          try { const err = await startRes.json(); detail = err.error || err.details || detail; } catch (_) {}
+          throw new Error(`Modal export ${startRes.status}: ${detail}`);
+        }
+        const startData = await startRes.json();
+        if (!startData.job_id) throw new Error("Modal export: no job id returned.");
+        // Fake progress: the job only ever reports 0 -> done, so count up
+        // ourselves. Fast at first, then easing toward 98% and creeping —
+        // it never reaches it. Real completion snaps the bar to 100% below.
+        let fakePct = 10;
+        const fakeTimer = setInterval(() => {
+          fakePct = Math.min(98, fakePct + Math.max(0.1, (98 - fakePct) * 0.05));
+          setProgress(fakePct);
+        }, 400);
+        let job;
+        try {
+          job = await pollExportJob(startData.job_id, () => {});
+        } finally {
+          clearInterval(fakeTimer);
+        }
+        outputFile = job.output_file; // set by /export/modal on completion
+      } else if (engine && engine.isSupported()) {
         exportPath = "client";
         const result = await engine.exportScene({
           onProgress: (p) => { setProgress(p); },
@@ -3653,7 +3825,7 @@ function _renderBanner(el) {
       const r = await fetch(`/export/status/${jobId}`);
       if (!r.ok) throw new Error(`Status check failed (${r.status})`);
       job = await r.json();
-      if (typeof job.progress === "number") onProgress(job.progress);
+      if (typeof job.progress === "number" && onProgress) onProgress(job.progress);
       if (job.status === "done") return job;
       if (job.status === "error") throw new Error(job.error || "FFmpeg failed.");
     }
