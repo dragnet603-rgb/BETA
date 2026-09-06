@@ -25,7 +25,9 @@ try:
 except ImportError:  # pragma: no cover
     pass
 
-_DB_PATH = Path(__file__).resolve().parent / "stats.db"
+# Persist across deploys: point STATS_DB_PATH at a persistent-disk mount
+# (e.g. Render persistent disk). Falls back to the repo root for local dev.
+_DB_PATH = Path(os.environ.get("STATS_DB_PATH", str(Path(__file__).resolve().parent / "stats.db")))
 _lock = threading.Lock()
 
 # Read lazily so a late load_dotenv() (or a real env var set after
