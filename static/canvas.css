@@ -501,8 +501,7 @@ outline: none;
 background: transparent;
 color: white;
 font-size: 4vw;
-
-transform: translateX(18px);
+transform: translateX(10px);
 
 }
 .uploadBtn {
@@ -515,7 +514,7 @@ transform: translateX(18px);
   display: grid;
   place-items: center;
   flex-shrink: 0;
-  transform: translateX(6px);
+  transform: translateX(4px);
 }
 
 .uploadBtn img {
