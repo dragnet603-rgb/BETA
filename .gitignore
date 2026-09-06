@@ -13,3 +13,7 @@ code_backup_*/
 *.tmp
 *.bak
 static/processed/
+
+# Live stats database — tracked by git previously, but deploys would
+# clobber the server's accumulated signups/exports. Keep it local only.
+stats.db
