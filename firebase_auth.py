@@ -74,6 +74,15 @@ def _posthog_capture(event, distinct_id, properties=None):
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 AUTH_ENABLED = bool(FIREBASE_PROJECT_ID)
 
+# LOGIN IS OPEN: every visitor can use the app without signing in (a
+# guest session is handed out automatically in require_login()). The
+# actual Firebase sign-in flow is restricted to this single email -
+# the app owner - who still needs it for the /admin stats page.
+# Override with the ALLOWED_LOGIN_EMAIL env var.
+ALLOWED_LOGIN_EMAIL = os.getenv(
+    "ALLOWED_LOGIN_EMAIL", "temiolajide108@gmail.com"
+).strip().lower()
+
 # Routes reachable without a session. /static is also exempt
 # (Flask serves it directly), which keeps JS/CSS/images public;
 # uploaded/output media live there too and are therefore not
@@ -144,25 +153,19 @@ def _is_public(path: str) -> bool:
 
 @auth_bp.before_app_request
 def require_login():
-    """Gate every request behind a valid Firebase-backed session."""
-    if not AUTH_ENABLED or _is_public(request.path):
-        return None
+    """Login gate DISABLED: the app is open to everyone.
 
-    if session.get("uid"):
-        return None
-
-    # Browser JS calls get a JSON 401; page loads get redirected.
-    if (
-        request.path.startswith("/api/")
-        or request.path.startswith("/export/status/")
-        or (
-            request.method == "POST"
-            and not request.path.startswith(("/upload", "/edit", "/export"))
-        )
-    ):
-        return jsonify(error="unauthenticated"), 401
-
-    return redirect(url_for("auth.login_page", next=request.full_path))
+    Every visitor automatically gets a guest session so stats logging
+    still works (guest events are grouped under the "guest" uid).
+    Only the owner can still sign in via /login (needed for the
+    /admin stats page); that restriction is enforced in
+    create_session() below.
+    """
+    if not session.get("uid"):
+        session["uid"] = "guest"
+        session.setdefault("email", "")
+        session.permanent = True
+    return None
 
 
 @auth_bp.route("/login")
@@ -198,19 +201,26 @@ def create_session():
     except Exception as exc:
         return jsonify(error=f"Invalid token: {exc}"), 401
 
+    # Only the owner may sign in (needed for the /admin stats page);
+    # everyone else just uses the app anonymously via the guest session.
+    email = (decoded.get("email") or "").strip().lower()
+    if ALLOWED_LOGIN_EMAIL and email != ALLOWED_LOGIN_EMAIL:
+        return jsonify(error="Sign-in is restricted to the app owner."), 403
+
     session.clear()
     # Firebase ID tokens carry the user id in "sub" (and "user_id"),
     # not "uid" - accept any of the three spellings.
     uid = decoded.get("uid") or decoded.get("user_id") or decoded.get("sub")
     session["uid"] = uid
-    # Stats: first session for this uid = sign-up, else sign-in.
+    # Stats: signup vs signin is decided client-side (Firebase
+    # creationTime vs lastSignInTime, or the signup form toggle) and
+    # forwarded in the request body. Do NOT use is_new_user(uid) here:
+    # a wiped stats DB (fresh deploy on an ephemeral disk) made every
+    # re-login count as a brand-new signup, inflating the number.
     try:
         import stats
-        email = decoded.get("email", "")
-        if stats.is_new_user(uid):
-            stats.log_event(email, uid, "signed_up")
-        else:
-            stats.log_event(email, uid, "signed_in")
+        is_signup = bool(data.get("isSignup"))
+        stats.log_event(email, uid, "signed_up" if is_signup else "signed_in")
     except Exception:
         pass
     session["email"] = decoded.get("email", "")

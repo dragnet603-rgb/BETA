@@ -112,7 +112,9 @@ def counts():
         "signups": ("signed_up",),
         "uploads": ("uploaded",),
         "prompts": ("prompt_sent",),
-        "exports": ("export_started", "export_completed"),
+        # Only completed exports; export_started + export_completed
+        # together double-counted every finished export.
+        "exports": ("export_completed",),
     }
     try:
         with _lock:

@@ -78,7 +78,24 @@ app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 31536000
 # ------------------------------------------------------------
 from firebase_auth import AUTH_ENABLED, auth_bp  # noqa: E402
 
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or os.urandom(32).hex()
+# A random per-process SECRET_KEY invalidates every session cookie on
+# each restart/deploy, forcing everyone to log in again (which also
+# skews sign-in stats). Persist a generated key to disk when no env
+# var is set so sessions survive restarts. Prefer a real env var in
+# production.
+_SECRET_KEY_FILE = Path(__file__).resolve().parent / ".secret_key"
+if os.getenv("SECRET_KEY"):
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY")
+else:
+    if _SECRET_KEY_FILE.exists():
+        app.config["SECRET_KEY"] = _SECRET_KEY_FILE.read_text().strip()
+    else:
+        _generated = os.urandom(32).hex()
+        try:
+            _SECRET_KEY_FILE.write_text(_generated)
+        except OSError:  # read-only FS (some hosts) - fall back to random
+            pass
+        app.config["SECRET_KEY"] = _generated
 app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 31  # 31 days
 app.register_blueprint(auth_bp)
 
@@ -371,6 +388,115 @@ def first_defined(*values):
 
 
 # ============================================================
+# TRIM FOLLOW-UP — bare "cut N seconds" answered by typing
+# ============================================================
+
+# Matches the pending question text the safety net / planner sends for a
+# bare trim amount (e.g. "Which 5 seconds should I cut — the first, ...").
+_TRIM_QUESTION_PATTERN = re.compile(
+    r"which\s+.*?seconds\s+should\s+i\s+cut",
+    re.IGNORECASE,
+)
+
+# "first 5", "the last 3s", "middle", "cut the first 10 seconds", ...
+_TRIM_ANSWER_PATTERN = re.compile(
+    r"\b(first|beginning|start|last|end|ending|middle|center|centre)\b",
+    re.IGNORECASE,
+)
+
+# Optional new amount inside the answer: "last 3", "first 10s", "middle 2.5".
+_TRIM_ANSWER_SECONDS = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?::(\d{1,2}))?\s*(s(?:ec(?:ond)?s?)?|m(?:in(?:ute)?s?)?)?\b",
+    re.IGNORECASE,
+)
+
+
+def _trim_answer_seconds(text):
+    """Parse an optional seconds amount from a trim follow-up answer."""
+    match = _TRIM_ANSWER_SECONDS.search(text or "")
+    if not match:
+        return None
+    if match.group(2) is not None:
+        try:
+            return float(match.group(1)) * 60 + float(match.group(2))
+        except (TypeError, ValueError):
+            return None
+    try:
+        value = float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    unit = (match.group(3) or "s").lower()
+    if unit.startswith("m"):
+        value *= 60
+    return value
+
+
+def _resolve_trim_followup(scene, prompt, pending_question):
+    """Resolve a typed answer to the bare-trim question.
+
+    Returns None when this is NOT a trim follow-up (caller falls through
+    to the normal planner path). Otherwise returns a dict with
+    seconds/position/start/end, or {"error": ...} when the answer or the
+    video duration cannot be resolved.
+    """
+    question = str(pending_question or "")
+    text = str(prompt or "").strip()
+    if not text or not _TRIM_QUESTION_PATTERN.search(question):
+        return None
+
+    lowered = text.lower()
+    if "first" in lowered or "beginning" in lowered or "from the start" in lowered:
+        position = "first"
+    elif "last" in lowered or "ending" in lowered or re.search(r"\bend\b", lowered):
+        position = "last"
+    elif "middle" in lowered or "center" in lowered or "centre" in lowered:
+        position = "middle"
+    elif _TRIM_ANSWER_PATTERN.search(text):
+        position = "middle"
+    else:
+        return {
+            "error": (
+                "Which part should I cut — reply with the first, "
+                "the middle, or the last?"
+            )
+        }
+
+    # Seconds: prefer an explicit amount in the answer ("last 3"),
+    # otherwise reuse the amount from the original question ("Which 5 ...").
+    seconds = _trim_answer_seconds(text)
+    if seconds is None:
+        seconds = _trim_answer_seconds(question)
+    if not seconds or seconds <= 0:
+        return {"error": "How many seconds should I cut?"}
+
+    duration = 0.0
+    try:
+        duration = float(scene.video.duration) if scene.video else 0.0
+    except (TypeError, ValueError):
+        duration = 0.0
+    if not duration or duration <= 0:
+        return {"error": "Video is still loading — try again in a moment."}
+
+    if seconds >= duration:
+        seconds = max(0.25, duration - 0.5)
+
+    if position == "first":
+        start, end = seconds, duration
+    elif position == "last":
+        start, end = 0.0, max(0.25, duration - seconds)
+    else:
+        mid = duration / 2.0
+        start, end = max(0.0, mid - seconds / 2.0), min(duration, mid + seconds / 2.0)
+
+    return {
+        "seconds": seconds,
+        "position": position,
+        "start": start,
+        "end": end,
+    }
+
+
+# ============================================================
 # SCENE NORMALIZATION
 # ============================================================
 
@@ -622,6 +748,7 @@ def normalize_action(action):
         "speed",
         "start",
         "end",
+        "seconds",
         "shape",
         "role",
         "alignment",
@@ -716,6 +843,43 @@ def normalize_result(result):
 
     if "scene" in result:
         normalized["scene"] = result["scene"]
+
+    # Preserve bare-trim seconds so the follow-up answer ("first", "last",
+    # "middle") can be resolved against the original amount.
+    if result.get("seconds") is not None:
+        normalized["seconds"] = result.get("seconds")
+
+    # TRIM SAFETY NET — a bare "cut N seconds" that the planner turned into
+    # a trim_video with seconds but NO position/start/end must not apply a
+    # guessed range. Coerce to a plain-text clarification (existing AQ bubble;
+    # the user answers by typing, no buttons) asking First/Middle/Last.
+    for _a in normalized["plan"]["actions"]:
+        if not isinstance(_a, dict) or _a.get("action") != "trim_video":
+            continue
+        _p = _a.get("properties") or {}
+        _has_range = _p.get("start") is not None and _p.get("end") is not None
+        _has_pos = str(_p.get("position") or "").strip().lower() in {
+            "first", "last", "middle", "beginning", "start", "end",
+        }
+        if not _has_range and not _has_pos and _p.get("seconds") is not None:
+            try:
+                normalized["seconds"] = float(_p.get("seconds"))
+            except (TypeError, ValueError):
+                pass
+            normalized["plan"]["actions"] = []
+            normalized["response_type"] = "clarification"
+            secs = normalized.get("seconds")
+            try:
+                secs_txt = f"{float(secs):g}"
+            except (TypeError, ValueError):
+                secs_txt = str(secs)
+            normalized["message"] = (
+                f"Which {secs_txt} seconds should I cut — the first, "
+                f"the middle, or the last?"
+            )
+            normalized["intent_summary"] = normalized["message"]
+            normalized["plan"]["intent_summary"] = normalized["message"]
+            break
 
     # Preserve OpenRouter chain-of-thought (when present) so the browser can
     # store it in history and forward it for multi-turn reasoning.
@@ -1306,6 +1470,74 @@ def autoquence_edit():
 
     try:
         scene = build_scene(scene_data)
+
+        # ── TRIM FOLLOW-UP SHORT-CIRCUIT ────────────────────────
+        # Bare "cut 5 seconds" was answered with a plain-text clarification
+        # ("Which 5 seconds — first, middle, or last?"). The user answers by
+        # TYPING ("first", "last 3", "the middle", ...). Resolve it here —
+        # deterministically, no LLM call — so one-word replies like "first"
+        # (which the vague/chat gates would otherwise swallow) just work.
+        trim_followup = _resolve_trim_followup(scene, prompt, pending_question)
+        if trim_followup is not None:
+            if trim_followup.get("error"):
+                return jsonify({
+                    "response_type": "clarification",
+                    "message": trim_followup["error"],
+                    "intent_summary": "Trim follow-up needs a valid choice.",
+                    "plan": {"actions": [], "assumptions": []},
+                })
+            action = {
+                "action": "trim_video",
+                "properties": {
+                    "seconds": trim_followup["seconds"],
+                    "position": trim_followup["position"],
+                    "start": trim_followup["start"],
+                    "end": trim_followup["end"],
+                },
+            }
+            scene.canvas["trim"] = {
+                "start": trim_followup["start"],
+                "end": trim_followup["end"],
+                "seconds": trim_followup["seconds"],
+                "position": trim_followup["position"],
+            }
+            secs_txt = f"{float(trim_followup['seconds']):g}"
+            pos = trim_followup["position"]
+            if pos == "first":
+                message = (
+                    f"Cut the first {secs_txt}s — preview starts at "
+                    f"{trim_followup['start']:.1f}s."
+                )
+            elif pos == "last":
+                message = (
+                    f"Cut the last {secs_txt}s — preview ends at "
+                    f"{trim_followup['end']:.1f}s."
+                )
+            else:
+                message = (
+                    f"Keeping the middle {secs_txt}s "
+                    f"({trim_followup['start']:.1f}s–{trim_followup['end']:.1f}s)."
+                )
+            print(f"[TRIM] follow-up resolved: {trim_followup}")
+            return jsonify({
+                "response_type": "edit",
+                "message": message,
+                "intent_summary": message,
+                "plan": {
+                    "intent_summary": message,
+                    "actions": [normalize_action(action)],
+                    "assumptions": [
+                        f"Trimmed {pos} {secs_txt}s; middle keeps the centered segment."
+                    ],
+                },
+                "scene": {
+                    "canvas": {
+                        "background": scene.canvas.get("background"),
+                        "speed": scene.canvas.get("speed", 1.0),
+                        "trim": scene.canvas.get("trim"),
+                    },
+                },
+            })
 
         # ── BAKED-TEXT REMOVAL SHORT-CIRCUIT ────────────────────
         # "Remove the text from the banner" is a pixel-level op the
