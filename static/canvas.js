@@ -4192,6 +4192,9 @@ function _renderBanner(el) {
     if (!input) return;
     const prompt = input.value.trim();
     if (!prompt) return;
+    // Free-tier prompt analytics: every typed prompt is captured here
+    // (covers both the local trim/split fast-path and server round trips).
+    try { window.posthog?.capture("prompt_sent", { prompt }); } catch (_) {}
     // Trim/split fast-path BEFORE any loading state or server call.
     if (_maybeOpenTrimTimelineFast(prompt)) { input.value = ""; return; }
     if (btn) { btn.classList.add("loading"); btn.disabled = true; }
@@ -4691,11 +4694,9 @@ function _renderBanner(el) {
     // Re-clamp an existing trim to the real duration and jump into range.
     _applyTrimToPreview();
     renderScene();
-    // Auto-open the trim timeline as soon as the video is ready — it lives
-    // permanently between the canvas and the prompt input, no prompt needed.
-    if (!_trimOpen && Number.isFinite(Number(videoEl.duration)) && videoEl.duration > 0) {
-      try { openTrimTimeline(null); } catch (_) {}
-    }
+    // The trim timeline stays hidden by default; it only opens when the
+    // user explicitly asks to trim/split ("open the timeline" or a trim
+    // prompt fast-path) — never automatically on video load.
   });
 
   // Frame pixels are only guaranteed from "loadeddata" on. Re-render so
