@@ -147,6 +147,23 @@ def recent(limit=60):
         return []
 
 
+def prompts(limit=200):
+    """Every prompt sent to Autoquence, newest first (text, who, when)."""
+    try:
+        with _lock:
+            conn = _conn()
+            rows = conn.execute(
+                "SELECT email, detail, created_at FROM events"
+                " WHERE event = 'prompt_sent'"
+                " ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
 def per_user():
     """One row per person: counts, first seen, last seen."""
     try:

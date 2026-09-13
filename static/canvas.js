@@ -158,6 +158,7 @@ document.addEventListener("DOMContentLoaded", () => {
     scene = JSON.parse(JSON.stringify(history[histIdx]));
     _lastCropKey = null;
     renderScene();
+    _applyTrimToPreview(); // re-seek if the restored state has a trim
     _refreshUndoUI();
   }
 
@@ -168,6 +169,7 @@ document.addEventListener("DOMContentLoaded", () => {
     scene = JSON.parse(JSON.stringify(history[histIdx]));
     _lastCropKey = null;
     renderScene();
+    _applyTrimToPreview(); // re-seek if the restored state has a trim
     _refreshUndoUI();
   }
 
@@ -1910,6 +1912,8 @@ function _renderBanner(el) {
       case "resize_video":   _execResizeVideo(a);   break;
       case "set_speed":      _execSetSpeed(a);      break;
       case "trim_video":     _execTrim(a);          break;
+      case "untrim_video":
+      case "clear_trim":     _execUntrim();         break;
       case "set_background": _execBackground(a);    break;
       case "bring_forward":  _execBringFwd(a);      break;
       case "send_backward":  _execSendBwd(a);       break;
@@ -2821,12 +2825,91 @@ function _renderBanner(el) {
   }
 
   // ─── trim_video ───────────────────────────────────────────────
-  function _execTrim(a) {
+  //
+  // Makes "cut 5 seconds" actually change the PREVIEW: the video is
+  // seeked into the kept range and playback is clamped to [start, end]
+  // via timeupdate guards below. Accepts three shapes:
+  //   {start, end}                  — absolute seconds
+  //   {properties:{seconds, position}} — position = first|last|middle,
+  //     resolved against the live video duration at execution time.
+  function _trimNumbers(v, fallback) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function _resolveTrimRange(a) {
     const p = a.properties || {};
-    scene.canvas.trim = {
-      start: a.start ?? p.start ?? 0,
-      end:   a.end   ?? p.end   ?? videoEl.duration,
-    };
+    const dur = _trimNumbers(videoEl.duration, null)
+      ?? _trimNumbers(scene.video.duration, null);
+    let start = (a.start !== undefined && a.start !== null) ? a.start : p.start;
+    let end   = (a.end !== undefined && a.end !== null) ? a.end : p.end;
+    const seconds  = (a.seconds !== undefined && a.seconds !== null) ? a.seconds : p.seconds;
+    const position = String((a.position !== undefined && a.position !== null ? a.position : p.position) || "").toLowerCase();
+
+    if ((start === undefined || start === null || end === undefined || end === null)
+        && seconds !== undefined && seconds !== null && position && dur) {
+      const secs = Number(seconds);
+      if (Number.isFinite(secs) && secs > 0) {
+        if (position === "first")      { start = secs; end = dur; }
+        else if (position === "last")  { start = 0; end = dur - secs; }
+        else if (position === "middle") {
+          const mid = dur / 2;
+          start = mid - secs / 2; end = mid + secs / 2;
+        }
+      }
+    }
+
+    start = _trimNumbers(start, 0);
+    end   = _trimNumbers(end, dur ?? start);
+    if (dur) {
+      start = Math.min(Math.max(0, start), dur - 0.05);
+      end   = Math.min(Math.max(start + 0.25, end), dur);
+    }
+    if (!(end > start)) end = start + 0.25;
+    return { start, end, dur };
+  }
+
+  function _applyTrimToPreview() {
+    const t = scene.canvas.trim;
+    if (!t) return;
+    const dur = Number(videoEl.duration);
+    const hasDur = Number.isFinite(dur) && dur > 0;
+    let { start, end } = t;
+    if (hasDur) {
+      start = Math.min(Math.max(0, Number(start) || 0), dur - 0.05);
+      end   = Math.min(Math.max(start + 0.25, Number(end) || dur), dur);
+      scene.canvas.trim.start = start;
+      scene.canvas.trim.end = end;
+    } else {
+      start = Number(start) || 0;
+      end = Number(end);
+      if (!Number.isFinite(end) || end <= start) end = start + 0.25;
+    }
+    // Jump the preview into the kept range so the trim is visible.
+    try {
+      if (!hasDur) return;
+      if (videoEl.currentTime < start - 0.05 || videoEl.currentTime >= end - 0.05) {
+        videoEl.currentTime = start;
+      }
+    } catch (_) { /* seek may throw before metadata loads */ }
+  }
+
+  function _execTrim(a) {
+    const { start, end } = _resolveTrimRange(a);
+    scene.canvas.trim = { start, end };
+    _applyTrimToPreview();
+    // If the trim came from anywhere (AI, typed answer, server scene),
+    // surface the timeline so the user sees the trimmed range and can
+    // fine-tune it. Deferred a tick so callers can finish rendering first.
+    if (typeof openTrimTimeline === "function") {
+      setTimeout(() => { try { openTrimTimeline({ start, end }); } catch (_) {} }, 60);
+    }
+  }
+
+  /** Clear any active trim and let the full video play again. */
+  function _execUntrim() {
+    scene.canvas.trim = null;
+    try { videoEl.currentTime = 0; } catch (_) {}
   }
 
   // ─── set_background ───────────────────────────────────────────
@@ -2998,6 +3081,8 @@ function _renderBanner(el) {
     // Results with NO actions (misclassified vague prompts) also stay visible.
     // Successful edit confirmations are deferred until the animations finish
     // (the canvas itself is the progress UI while the edit plays out).
+    // NOTE: no trim_choice type exists — a bare "cut N seconds" returns a
+    // plain-text clarification and the user answers by typing.
     const actions = result?.plan?.actions || result?.actions || [];
     const isSwap = !!result.video_swapped;
     const needsInput =
@@ -3023,15 +3108,29 @@ function _renderBanner(el) {
     // bubble appears only AFTER the materialization animations settle.
     if (!isEdit) showResultMsg();
 
-    // Track the question Autoquence is waiting on. A clarification or
-    // crop choice ALWAYS sets it; a conversation sets it only if the
-    // message actually asks something; a successful edit clears it.
+    // Track the question Autoquence is waiting on. A clarification or crop
+    // choice ALWAYS sets it; a conversation sets it only if the message
+    // actually asks something; a successful edit clears it. (A bare trim
+    // amount is just a clarification — the typed answer resolves server-side.)
     if (result.response_type === "clarification" || result.response_type === "crop_choice") {
       pendingQuestion = result.message || "";
     } else if (result.response_type === "conversation") {
       pendingQuestion = (result.message || "").trim().endsWith("?") ? result.message : null;
     } else if (actions.length > 0 || isSwap) {
       pendingQuestion = null;
+    }
+
+    // Server asked to open the timeline (bare "split"/"trim" request):
+    // show it in place of the prompt box. Definition is function-scoped
+    // below, so guard for older cached bundles lacking it.
+    if (result.response_type === "clarification"
+        && /open the timeline/i.test(result.message || "")
+        && typeof openTrimTimeline === "function") {
+      pendingQuestion = null;
+      _hideResponseBox();
+      console.groupEnd();
+      openTrimTimeline(null);
+      return;
     }
 
     if (result.response_type === "clarification" || result.response_type === "conversation") {
@@ -3121,17 +3220,37 @@ function _renderBanner(el) {
     console.groupEnd();
   }
 
-  /** Adopt ONLY canvas-level changes (background, speed, crop) from server scene, without replacing elements */
+  /** Adopt ONLY canvas-level changes (background, speed, crop, trim) from server scene, without replacing elements */
   function _adoptCanvasOnly(ss) {
     if (!ss) return;
-    if (ss.canvas?.background && ss.canvas.background !== scene.canvas.background) {
-      scene.canvas.background = ss.canvas.background;
+    const canvas = ss.canvas || {};
+    if (canvas.background && canvas.background !== scene.canvas.background) {
+      scene.canvas.background = canvas.background;
     }
-    if (ss.canvas?.speed && ss.canvas.speed !== scene.canvas.speed) {
-      scene.canvas.speed = ss.canvas.speed;
-      videoEl.playbackRate = ss.canvas.speed;
+    if (canvas.speed && canvas.speed !== scene.canvas.speed) {
+      scene.canvas.speed = canvas.speed;
+      videoEl.playbackRate = canvas.speed;
     }
-    const ssCrop = ss.canvas?.crop || ss.video?.crop;
+    // Trim: adopt + enforce in the preview (seek into range, clamp).
+    if (canvas.trim && typeof canvas.trim === "object") {
+      const cur = scene.canvas.trim;
+      const incoming = canvas.trim;
+      const curStart = (cur && cur.start !== undefined && cur.start !== null) ? cur.start : -1;
+      const curEnd = (cur && cur.end !== undefined && cur.end !== null) ? cur.end : -1;
+      const inStart = (incoming.start !== undefined && incoming.start !== null) ? incoming.start : -1;
+      const inEnd = (incoming.end !== undefined && incoming.end !== null) ? incoming.end : -1;
+      const changed = !cur
+        || Math.abs(curStart - inStart) > 1e-6
+        || Math.abs(curEnd - inEnd) > 1e-6;
+      if (changed) {
+        scene.canvas.trim = {
+          start: (incoming.start !== undefined && incoming.start !== null) ? incoming.start : 0,
+          end:   incoming.end,
+        };
+        _applyTrimToPreview();
+      }
+    }
+    const ssCrop = canvas.crop || (ss.video && ss.video.crop);
     if (ssCrop?.applied && !scene.video.crop.applied) {
       scene.video.crop = { ...ssCrop };
       _lastCropKey = null;
@@ -3458,9 +3577,483 @@ function _renderBanner(el) {
     return { x, y, w, h };
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // TRIM TIMELINE UI (Konva) — replaces the prompt box while open.
+  // Track + kept-range window + start/end handles + playhead.
+  // Dragging scrubs the preview LIVE (rAF-throttled seeks).
+  // Split = keep [playhead, selEnd]. Trim/Apply commit the window.
+  // Own Konva Stage (never the main edit stage) so timeline drags
+  // can never fight banner/crop drags. Times are in SECONDS.
+  // ─────────────────────────────────────────────────────────────
+  const _TRIM_MIN_KEEP = 0.25;
+  // CapCut-style rectangular edge grips: width of the start/end handle bars.
+  const _TRIM_HANDLE_W = 12;
+  // Fixed-center playhead: seconds of video visible across the track at once.
+  // Longer videos are zoomed in to this window; dragging pans the video
+  // underneath a playhead pinned to the track's center (edge-glide near 0:00
+  // and the end).
+  const _TRIM_VIEW_DUR = 15;
+  let _trimOpen = false;
+  let _trimSel = { start: 0, end: 0 };
+  let _trimPlay = 0;
+  // Panning view window: start = video time shown at the track's left edge,
+  // pps = pixels per second at the current zoom.
+  let _trimView = { start: 0, pps: 10 };
+  let _trimBefore = null;
+  let _trimSeekQueued = null;
+  let _trimStage = null, _trimLayer = null;
+  let _trimTrack = null, _trimKept = null;
+  let _trimStartHandle = null, _trimEndHandle = null;
+  let _trimPlayhead = null, _trimKnob = null;
+
+  function _trimDuration() {
+    const d = Number(videoEl.duration);
+    if (Number.isFinite(d) && d > 0) return d;
+    const s = Number(scene.video.duration);
+    return (Number.isFinite(s) && s > 0) ? s : 0;
+  }
+
+  function _trimFmt(t) {
+    t = Math.max(0, Number(t) || 0);
+    const m = Math.floor(t / 60), s = t - m * 60;
+    return `${m}:${s < 10 ? "0" : ""}${s.toFixed(1)}`;
+  }
+
+  function _trimArea() {
+    const box = document.getElementById("trimTimelineKonva");
+    const w = Math.max(200, box ? box.clientWidth : 300);
+    return { w, h: 64, padX: 18, trackY: 26, trackH: 12 };
+  }
+
+  // View-based time↔x mapping: the playhead is pinned to the track's center
+  // and the video slides underneath it (CapCut-style). _trimView.start is the
+  // video time at the track's left edge.
+  function _trimX(t) {
+    const a = _trimArea();
+    return a.padX + (t - _trimView.start) * _trimView.pps;
+  }
+
+  function _trimT(x) {
+    const a = _trimArea();
+    const dur = _trimDuration();
+    const t = _trimView.start + (x - a.padX) / _trimView.pps;
+    return Math.min(Math.max(0, t), dur || t);
+  }
+
+  // Re-pan the view so the playhead time sits at the track's center
+  // (clamped so the view never scrolls past the video's start/end; when the
+  // whole clip fits in the window the playhead "glides" at the edges).
+  function _trimRecenter() {
+    const dur = _trimDuration();
+    const a = _trimArea();
+    const inner = Math.max(1, a.w - a.padX * 2);
+    const viewDur = Math.min(dur || _TRIM_VIEW_DUR, _TRIM_VIEW_DUR);
+    _trimView.pps = inner / viewDur;
+    if (dur > viewDur) {
+      const desired = _trimPlay - (a.w / 2 - a.padX) / _trimView.pps;
+      _trimView.start = Math.min(Math.max(0, desired), dur - viewDur);
+    } else {
+      _trimView.start = 0;
+    }
+  }
+
+  // Pan the view the MINIMUM needed to bring time t into the visible window
+  // (used when dragging grips toward the track edges — the playhead does NOT
+  // move; only the window slides so the grip stays reachable).
+  function _trimEnsureVisible(t) {
+    const dur = _trimDuration();
+    const a = _trimArea();
+    const inner = Math.max(1, a.w - a.padX * 2);
+    const viewDur = Math.min(dur || _TRIM_VIEW_DUR, _TRIM_VIEW_DUR);
+    _trimView.pps = inner / viewDur;
+    if (dur > viewDur) {
+      const t0 = Math.min(Math.max(0, t), dur);
+      if (t0 < _trimView.start) _trimView.start = t0;
+      else if (t0 > _trimView.start + viewDur) _trimView.start = t0 - viewDur;
+      _trimView.start = Math.min(Math.max(0, _trimView.start), dur - viewDur);
+    } else {
+      _trimView.start = 0;
+    }
+  }
+
+  // Open-state view: show the clip from 0:00 (left edge) — no recentering
+  // jumps. The playhead only locks to center once the user slides the track
+  // or playback pans the window.
+  function _trimResetView() {
+    const dur = _trimDuration();
+    const a = _trimArea();
+    const inner = Math.max(1, a.w - a.padX * 2);
+    const viewDur = Math.min(dur || _TRIM_VIEW_DUR, _TRIM_VIEW_DUR);
+    _trimView.pps = inner / viewDur;
+    _trimView.start = 0;
+  }
+
+  // Pan the view by a pixel delta; the video time under the center playhead
+  // becomes the new playhead time (live-scrubs the preview).
+  function _trimPanBy(dx) {
+    const dur = _trimDuration();
+    const a = _trimArea();
+    const viewDur = Math.min(dur || _TRIM_VIEW_DUR, _TRIM_VIEW_DUR);
+    if (dur > viewDur) {
+      _trimView.start = Math.min(
+        Math.max(0, _trimView.start + dx / _trimView.pps),
+        dur - viewDur
+      );
+    } else {
+      _trimView.start = 0;
+    }
+    _trimPlay = Math.min(Math.max(0, _trimView.start + (a.w / 2 - a.padX) / _trimView.pps), dur || 0);
+    _trimSeekLive(_trimPlay);
+    _trimDraw();
+  }
+
+  function _trimSeekLive(t) {
+    // rAF-throttle: dragging fires dozens of events/sec; the video only
+    // needs the latest target per frame.
+    _trimSeekQueued = t;
+    if (_trimSeekLive._raf) return;
+    _trimSeekLive._raf = requestAnimationFrame(() => {
+      _trimSeekLive._raf = null;
+      const target = _trimSeekQueued;
+      _trimSeekQueued = null;
+      if (target === null || target === undefined) return;
+      try {
+        if (Math.abs(videoEl.currentTime - target) > 0.03) videoEl.currentTime = target;
+      } catch (_) { /* seek before metadata — labels still update */ }
+    });
+  }
+
+  function _trimDraw() {
+    if (!_trimOpen || !_trimStage) return;
+    const dur = _trimDuration() || 1;
+    const a = _trimArea();
+    if (Math.abs(_trimStage.width() - a.w) > 1) {
+      _trimStage.width(a.w);
+      _trimStage.height(a.h);
+    }
+    const x0 = Math.max(a.padX, _trimX(0));
+    const x1 = Math.min(a.w - a.padX, _trimX(dur));
+    // Selection edges clamp to the track bounds when partially out of view
+    // (CapCut clips the selection window at the edges).
+    const sx = Math.min(Math.max(a.padX, _trimX(_trimSel.start)), a.w - a.padX);
+    const ex = Math.min(Math.max(a.padX, _trimX(_trimSel.end)), a.w - a.padX);
+    const px = _trimX(_trimPlay);
+
+    _trimTrack.position({ x: x0, y: a.trackY });
+    _trimTrack.size({ width: Math.max(1, x1 - x0), height: a.trackH });
+
+    _trimKept.position({ x: sx, y: a.trackY - 2 });
+    _trimKept.size({ width: Math.max(2, ex - sx), height: a.trackH + 4 });
+
+    // Rect grips: node origin is top-left → offset by half the bar width
+    // so the bar is centered on the selection edge.
+    _trimStartHandle.position({ x: sx - _TRIM_HANDLE_W / 2, y: a.trackY + a.trackH / 2 - (_trimStartHandle.height() / 2) });
+    _trimEndHandle.position({ x: ex - _TRIM_HANDLE_W / 2, y: a.trackY + a.trackH / 2 - (_trimEndHandle.height() / 2) });
+    _trimPlayhead.points([px, 6, px, a.trackY + a.trackH + 8]);
+    _trimKnob.position({ x: px, y: 10 });
+    _trimLayer.batchDraw();
+
+    const sl = document.getElementById("trimStartLabel");
+    const el = document.getElementById("trimEndLabel");
+    const rl = document.getElementById("trimRangeLabel");
+    if (sl) sl.textContent = _trimFmt(_trimSel.start);
+    if (el) el.textContent = _trimFmt(_trimSel.end);
+    // if (rl) rl.textContent = `${(_trimSel.end - _trimSel.start).toFixed(1)}s kept`;
+  }
+
+  function _trimSetPlay(t, scrub) {
+    const dur = _trimDuration();
+    _trimPlay = dur ? Math.min(Math.max(0, t), dur) : Math.max(0, t);
+    if (scrub) _trimSeekLive(_trimPlay);
+    // Re-pan the view so the playhead stays pinned at the track's center
+    // (with edge-glide near 0:00 / the end).
+    _trimRecenter();
+    _trimDraw();
+  }
+
+  function _trimSetSel(start, end, scrubTo) {
+    const dur = _trimDuration() || Math.max(end, 1);
+    start = Math.min(Math.max(0, start), dur);
+    end = Math.min(Math.max(0, end), dur);
+    if (end - start < _TRIM_MIN_KEEP) {
+      if (scrubTo === "start") start = Math.max(0, end - _TRIM_MIN_KEEP);
+      else end = Math.min(dur, start + _TRIM_MIN_KEEP);
+      if (end - start < _TRIM_MIN_KEEP) { start = 0; end = Math.min(dur, _TRIM_MIN_KEEP); }
+    }
+    _trimSel = { start, end };
+    if (scrubTo === "start") _trimSetPlay(start, true);
+    else if (scrubTo === "end") _trimSetPlay(end, true);
+    else if (scrubTo !== null && scrubTo !== undefined) _trimSetPlay(scrubTo, true);
+    _trimDraw();
+  }
+
+  // ── Timeline Konva stage: track, kept window, handles, playhead ──
+  function _trimInitKonva() {
+    if (_trimStage) return;
+    _trimStage = new Konva.Stage({
+      container: "trimTimelineKonva",
+      width: _trimArea().w,
+      height: _trimArea().h,
+    });
+    _trimLayer = new Konva.Layer();
+    _trimStage.add(_trimLayer);
+
+    _trimTrack = new Konva.Rect({
+      fill: "rgba(255,255,255,0.18)", listening: true,
+    });
+    _trimKept = new Konva.Rect({
+      fill: "rgba(45,238,6,0.35)", stroke: "greenyellow",
+      strokeWidth: 2, listening: false,
+    });
+    _trimPlayhead = new Konva.Line({
+      stroke: "#ffffff", strokeWidth: 2, listening: false,
+    });
+    const keepY = (pos, y) => ({ x: Math.max(0, pos.x), y });
+
+    // CapCut-style rectangular edge grips: tall white bars capping the
+    // selection's start/end (no circles, no rounded corners).
+    _trimStartHandle = new Konva.Rect({
+      width: _TRIM_HANDLE_W, height: _trimArea().trackH + 14,
+      fill: "#ffffff", stroke: "greenyellow", strokeWidth: 1.5,
+      draggable: true,
+      // Lock y to the bar's top-left origin so it stays vertically centered.
+      dragBoundFunc(pos) {
+        const a = _trimArea();
+        return keepY(pos, a.trackY - 7);
+      },
+    });
+    _trimEndHandle = new Konva.Rect({
+      width: _TRIM_HANDLE_W, height: _trimArea().trackH + 14,
+      fill: "#ffffff", stroke: "greenyellow", strokeWidth: 1.5,
+      draggable: true,
+      dragBoundFunc(pos) {
+        const a = _trimArea();
+        return keepY(pos, a.trackY - 7);
+      },
+    });
+    // Playhead cap: small solid white diamond (CapCut look) instead of a knob.
+    _trimKnob = new Konva.Line({
+      points: [-5, 0, 0, -5, 5, 0, 0, 5],
+      closed: true, fill: "#ffffff", listening: true,
+      draggable: true,
+      dragBoundFunc(pos) { return keepY(pos, 10); },
+    });
+
+    _trimLayer.add(_trimTrack, _trimKept, _trimPlayhead, _trimKnob,
+      _trimStartHandle, _trimEndHandle);
+
+    const playWhileScrub = () => {
+      try { videoEl.play(); playPauseBtn?.classList.add("active"); } catch (_) {}
+    };
+    _trimTrack.on("mousedown touchstart", () => {
+      const p = _trimStage.getPointerPosition();
+      if (!p) return;
+      _trimTrack._pressing = true;
+      _trimTrack._startX = p.x;
+      _trimTrack._startView = _trimView.start;
+      playWhileScrub();
+    });
+    _trimStage.on("mousemove touchmove", () => {
+      if (!_trimOpen || !_trimTrack._pressing) return;
+      const p = _trimStage.getPointerPosition();
+      if (!p || _trimTrack._startX == null) return;
+      // Drag = pan the video underneath the fixed center playhead; the time
+      // under the playhead live-scrubs the preview.
+      _trimView.start = Math.min(
+        Math.max(0, _trimTrack._startView - (p.x - _trimTrack._startX) / _trimView.pps),
+        Math.max(0, (_trimDuration() || _TRIM_VIEW_DUR) - Math.min(_trimDuration() || _TRIM_VIEW_DUR, _TRIM_VIEW_DUR))
+      );
+      const a = _trimArea();
+      _trimPlay = Math.min(
+        Math.max(0, _trimView.start + (a.w / 2 - a.padX) / _trimView.pps),
+        _trimDuration() || 0
+      );
+      _trimSeekLive(_trimPlay);
+      _trimDraw();
+    });
+    _trimStage.on("mouseup touchend", () => {
+      if (_trimTrack._pressing && _trimTrack._startX != null) {
+        const p = _trimStage.getPointerPosition();
+        // Simple tap (no real drag): seek to the tapped time and recenter.
+        if (p && Math.abs(p.x - _trimTrack._startX) < 4) {
+          _trimSetPlay(_trimT(p.x), true);
+        }
+      }
+      _trimTrack._pressing = false;
+      _trimTrack._startX = null;
+    });
+
+    _trimKnob.on("dragstart", playWhileScrub);
+    _trimKnob.on("dragmove", () => {
+      // Knob drag = pan: convert the knob's drag delta into a view pan.
+      const a = _trimArea();
+      const px = a.padX + (_trimPlay - _trimView.start) * _trimView.pps;
+      _trimPanBy(_trimKnob.x() - px);
+    });
+    _trimKnob.on("dragend", () => _trimDraw());
+
+    _trimStartHandle.on("dragstart", () => {
+      // Grips move the SELECTION only — never the playhead, never the video.
+      // If the grip's time is off-view, slide the window to bring it in.
+      try { videoEl.pause(); } catch (_) {}
+      _trimEnsureVisible(_trimSel.start);
+      _trimDraw();
+    });
+    _trimStartHandle.on("dragmove", () => {
+      // Rect origin is top-left → read the bar's CENTER x for time mapping.
+      const t = _trimT(_trimStartHandle.x() + _TRIM_HANDLE_W / 2, _trimDuration());
+      _trimSetSel(Math.min(t, _trimSel.end - _TRIM_MIN_KEEP), _trimSel.end, null);
+      // Auto-pan only when the grip hits the window edge (playhead stays put).
+      _trimEnsureVisible(t);
+      _trimDraw();
+    });
+    _trimEndHandle.on("dragstart", () => {
+      try { videoEl.pause(); } catch (_) {}
+      _trimEnsureVisible(_trimSel.end);
+      _trimDraw();
+    });
+    _trimEndHandle.on("dragmove", () => {
+      const t = _trimT(_trimEndHandle.x() + _TRIM_HANDLE_W / 2, _trimDuration());
+      _trimSetSel(_trimSel.start, Math.max(t, _trimSel.start + _TRIM_MIN_KEEP), null);
+      _trimEnsureVisible(t);
+      _trimDraw();
+    });
+  }
+
+  // ── Timeline open/close + Split/Trim/Apply/Cancel ──
+  // NOTE: openTrimTimeline is called by _execTrim(), which is defined
+  // ABOVE this block — function declarations hoist, so that call is safe.
+  function _trimCommitSelection(source) {
+    const dur = _trimDuration();
+    if (!(dur > 0)) {
+      showMsg("Video is still loading — try again in a moment.", { type: "error" });
+      return false;
+    }
+    const start = Math.min(Math.max(0, _trimSel.start), dur - 0.05);
+    const end = Math.min(Math.max(start + _TRIM_MIN_KEEP, _trimSel.end), dur);
+    _trimSel = { start, end };
+    saveHistory();
+    scene.canvas.trim = { start, end };
+    scene.version++;
+    _applyTrimToPreview();
+    renderScene();
+    _trimDraw();
+    window.posthog?.capture("timeline_trim_applied", { source, start, end, duration: dur });
+    return true;
+  }
+
+  // Open the timeline, hiding the prompt box. preselect = {start,end}|null.
+  function openTrimTimeline(preselect, _retried) {
+    const dur = _trimDuration();
+    if (!(dur > 0) && !_retried) {
+      // Metadata not parsed yet (fresh upload / slow moov atom): don't just
+      // bail with an error toast — open the timeline as soon as the duration
+      // becomes available (loadedmetadata), or after a short grace period.
+      showMsg("Loading video — opening the timeline in a moment…", { type: "info" });
+      const openWhenReady = () => {
+        videoEl.removeEventListener("loadedmetadata", openWhenReady);
+        clearTimeout(openWhenReady._to);
+        openTrimTimeline(preselect, true);
+      };
+      videoEl.addEventListener("loadedmetadata", openWhenReady, { once: true });
+      openWhenReady._to = setTimeout(() => {
+        videoEl.removeEventListener("loadedmetadata", openWhenReady);
+        openTrimTimeline(preselect, true);
+      }, 8000);
+      return;
+    }
+    if (!(dur > 0)) {
+      showMsg("Couldn't read the video length — try re-uploading the clip.", { type: "error" });
+      return;
+    }
+    _hideResponseBox();
+    hideCropChoiceChips();
+    _trimInitKonva();
+    _trimOpen = true;
+    _trimBefore = scene.canvas.trim ? { ...scene.canvas.trim } : null;
+    const validPre = preselect && Number.isFinite(Number(preselect.start))
+      && Number.isFinite(Number(preselect.end));
+    if (validPre) {
+      _trimSel = {
+        start: Math.min(Math.max(0, Number(preselect.start)), dur),
+        end: Math.min(Math.max(0, Number(preselect.end)), dur),
+      };
+    } else if (scene.canvas.trim && Number.isFinite(Number(scene.canvas.trim.end))) {
+      _trimSel = {
+        start: Math.min(Math.max(0, Number(scene.canvas.trim.start) || 0), dur),
+        end: Math.min(Math.max(0, Number(scene.canvas.trim.end) || dur), dur),
+      };
+    } else {
+      _trimSel = { start: 0, end: dur };
+    }
+    if (!(_trimSel.end > _trimSel.start)) _trimSel = { start: 0, end: dur };
+    _trimPlay = Math.min(Math.max(0, Number(videoEl.currentTime) || _trimSel.start), dur);
+    // Open showing the clip from 0:00: full range selected, end bar at the
+    // right edge. No recentering jumps; the playhead locks to center only
+    // when the user slides the track or playback pans the window.
+    _trimResetView();
+    _trimStage.width(Math.max(200, _trimArea().w));
+    _trimStage.height(64);
+    const tc = document.getElementById("trimControls");
+    if (tc) tc.style.display = "flex";
+    // The prompt input stays visible at all times — the timeline lives
+    // ABOVE it (between canvas and input bar), never replacing it.
+    _trimDraw();
+    _trimSeekLive(_trimPlay);
+    window.posthog?.capture("timeline_opened", { duration: dur, preselect: !!validPre });
+  }
+
+  // Close the timeline and bring the prompt box back.
+  function closeTrimTimeline() {
+    _trimOpen = false;
+    const tc = document.getElementById("trimControls");
+    if (tc) tc.style.display = "none";
+  }
+
+  document.getElementById("trimSplitBtn")?.addEventListener("click", () => {
+    // Split = keep the RIGHT side only: trim.start jumps to the playhead.
+    const dur = _trimDuration();
+    if (!(dur > 0)) return;
+    _trimSetSel(_trimPlay, Math.max(_trimSel.end, _trimPlay + _TRIM_MIN_KEEP), _trimPlay);
+    if (_trimCommitSelection("split")) {
+      showMsg(`Split at ${_trimFmt(_trimSel.start)} — keeping everything after it.`, { type: "success" });
+    }
+  });
+
+  document.getElementById("trimBtn")?.addEventListener("click", () => {
+    // Trim = commit the selected window without closing the UI.
+    if (_trimCommitSelection("trim")) {
+      showMsg(`Trimmed to ${_trimFmt(_trimSel.start)}–${_trimFmt(_trimSel.end)}. Tap Apply when done.`, { type: "success" });
+    }
+  });
+
+  document.getElementById("trimApplyBtn")?.addEventListener("click", () => {
+    if (_trimCommitSelection("apply")) {
+      const msg = `Trimmed to ${_trimFmt(_trimSel.start)}–${_trimFmt(_trimSel.end)}.`;
+      closeTrimTimeline();
+      showMsg(msg, { type: "success" });
+    }
+  });
+
+  document.getElementById("trimCancelBtn")?.addEventListener("click", () => {
+    // Cancel = reset the selection, DON'T close the panel. The timeline
+    // stays open above the prompt; the kept range snaps back to whatever
+    // trim existed before this editing session (full range if none).
+    scene.canvas.trim = _trimBefore ? { ..._trimBefore } : null;
+    _applyTrimToPreview();
+    renderScene();
+    const dur = _trimDuration();
+    _trimSel = { start: 0, end: dur || 1 };
+    _trimSetPlay(videoEl.currentTime, true);
+    _trimDraw();
+  });
+
+  window.addEventListener("resize", () => {
+    if (_trimOpen) _trimDraw();
+  });
+
   document.getElementById("ratio169")?.addEventListener("click", () => showCropBox(16/9));
   document.getElementById("ratio11") ?.addEventListener("click", () => showCropBox(1));
-
   document.getElementById("cropApply")?.addEventListener("click", () => {
     const c = getCropDataFromUI();
     saveHistory();
@@ -3529,6 +4122,69 @@ function _renderBanner(el) {
   // ─────────────────────────────────────────────────────────────
   // PROMPT FORM
   // ─────────────────────────────────────────────────────────────
+  // Frontend fast-path: bare "trim/split/cut" requests open the Konva
+  // timeline immediately (no server round-trip). "trim N secs" pre-applies
+  // a default end-trim [0, D-N] first, then opens the timeline showing it.
+  const _TRIM_FAST_RE = /\b(trim|split|cut)\b/i;
+  const _TRIM_TEXT_GUARD_RE = /\b(text|banner|caption|subtitle|title|overlay)\b/i;
+
+  function _trimFastSeconds(prompt) {
+    const text = String(prompt || "");
+    // Explicit unit or m:ss always counts ("trim 5s", "cut 2 minutes", "1:30").
+    let m = text.match(/(\d+(?:\.\d+)?)\s*(?::(\d{1,2}))?\s*(s(?:ec(?:ond)?s?)?|m(?:in(?:ute)?s?)?)\b/i);
+    if (m) {
+      if (m[2] !== undefined && m[2] !== null && m[2] !== "") {
+        const v = Number(m[1]) * 60 + Number(m[2]);
+        return Number.isFinite(v) && v > 0 ? v : null;
+      }
+      let v = Number(m[1]);
+      if (!Number.isFinite(v) || v <= 0) return null;
+      if ((m[3] || "").toLowerCase().startsWith("m")) v *= 60;
+      return v;
+    }
+    // Bare number only when it directly follows a trim verb ("trim 5",
+    // "cut 5 seconds" is caught above; "trim the 2nd scene" must NOT match).
+    m = text.match(/\b(?:trim|cut|split|remove|shorten)(?:\s+by)?\s+(\d+(?:\.\d+)?)\b/i);
+    if (!m) return null;
+    const v = Number(m[1]);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  }
+
+  // Returns true when the prompt was handled locally (timeline opened).
+  function _maybeOpenTrimTimelineFast(prompt) {
+    if (!_TRIM_FAST_RE.test(prompt || "")) return false;
+    // "remove the text in the banner" etc. is a baked-text op, not a trim.
+    if (_TRIM_TEXT_GUARD_RE.test(prompt || "")) return false;
+    // Position words ("cut the first 5 seconds") still go to the server so
+    // the first/last/middle meaning is preserved; the resulting edit opens
+    // the timeline via _execTrim.
+    if (/\b(first|last|middle|beginning|ending|start|end)\b/i.test(prompt || "")) return false;
+    const secs = _trimFastSeconds(prompt);
+    const dur = _trimDuration();
+    hideCropChoiceChips();
+    if (dur > 0 && secs && secs < dur) {
+      // Default for "trim N secs": shorten off the end → keep [0, D-N],
+      // then show the timeline already reflecting that trim.
+      const start = 0, end = dur - secs;
+      saveHistory();
+      scene.canvas.trim = { start, end };
+      scene.version++;
+      _applyTrimToPreview();
+      renderScene();
+      openTrimTimeline({ start, end });
+      window.posthog?.capture("timeline_opened", { via: "prompt", seconds: secs, duration: dur });
+    } else {
+      // Bare "trim" / "split" / "cut" — or duration not ready yet:
+      // open full-range (openTrimTimeline waits for metadata if needed).
+      openTrimTimeline(null);
+      window.posthog?.capture("timeline_opened", { via: "prompt", duration: dur });
+    }
+    // Stats: this prompt was handled locally and never reaches the
+    // server - beacon it so the stats page still counts every prompt.
+    try { navigator.sendBeacon("/api/stats/prompt", prompt); } catch (_) {}
+    return true;
+  }
+
   form?.addEventListener("submit", async e => {
     e.preventDefault();
     const btn   = document.querySelector(".uploadBtn");
@@ -3536,6 +4192,8 @@ function _renderBanner(el) {
     if (!input) return;
     const prompt = input.value.trim();
     if (!prompt) return;
+    // Trim/split fast-path BEFORE any loading state or server call.
+    if (_maybeOpenTrimTimelineFast(prompt)) { input.value = ""; return; }
     if (btn) { btn.classList.add("loading"); btn.disabled = true; }
     // Lightweight "generating" state: subtle blur + a small pulsing chip.
     // It is dismissed at the TOP of handleResult() — i.e. the moment the
@@ -3627,8 +4285,63 @@ function _renderBanner(el) {
   // ─────────────────────────────────────────────────────────────
   // PLAY / PAUSE
   // ─────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // TRIM PLAYBACK CLAMP — keep the preview inside [trim.start, trim.end].
+  // Without this, changing scene.canvas.trim would be invisible: the
+  // <video> would happily play the full clip. With it, "cut 5 seconds"
+  // visibly starts/ends where the trimmed video will.
+  // ─────────────────────────────────────────────────────────────
+  // Keep the timeline playhead in sync while the video plays normally.
+  videoEl.addEventListener("timeupdate", () => {
+    if (_trimOpen && typeof _trimDraw === "function" && _trimStage) {
+      const t = Number(videoEl.currentTime);
+      if (Number.isFinite(t)) {
+        // Route through _trimSetPlay so the view pans with playback and the
+        // playhead stays pinned at the track's center.
+        _trimSetPlay(t);
+      }
+    }
+    const trim = scene.canvas.trim;
+    if (!trim) return;
+    const start = Number(trim.start) || 0;
+    const end = Number(trim.end);
+    if (!Number.isFinite(end) || end <= start) return;
+    if (_trimOpen) return; // while scrubbing the timeline, don't fight the user
+    if (videoEl.currentTime < start - 0.08) {
+      try { videoEl.currentTime = start; } catch (_) {}
+    } else if (videoEl.currentTime >= end - 0.05) {
+      videoEl.pause();
+      playPauseBtn?.classList.remove("active");
+      try { videoEl.currentTime = Math.max(start, end - 0.05); } catch (_) {}
+    }
+  });
+
+  // Pressing play at/past the trim end restarts at the trim start.
+  videoEl.addEventListener("play", () => {
+    const t = scene.canvas.trim;
+    if (!t) return;
+    const start = Number(t.start) || 0;
+    const end = Number(t.end);
+    if (!Number.isFinite(end) || end <= start) return;
+    if (videoEl.currentTime < start - 0.05 || videoEl.currentTime >= end - 0.05) {
+      try { videoEl.currentTime = start; } catch (_) {}
+    }
+  });
+
   playPauseBtn?.addEventListener("click", () => {
-    if (videoEl.paused) { videoEl.play(); playPauseBtn.classList.add("active"); }
+    if (videoEl.paused) {
+      // Re-entering a trimmed range: jump back to its start first.
+      const t = scene.canvas.trim;
+      if (t) {
+        const start = Number(t.start) || 0;
+        const end = Number(t.end);
+        if (Number.isFinite(end) && end > start &&
+            (videoEl.currentTime < start - 0.05 || videoEl.currentTime >= end - 0.05)) {
+          try { videoEl.currentTime = start; } catch (_) {}
+        }
+      }
+      videoEl.play(); playPauseBtn.classList.add("active");
+    }
     else { videoEl.pause(); playPauseBtn.classList.remove("active"); }
   });
 
@@ -3975,7 +4688,14 @@ function _renderBanner(el) {
     scene.video.duration      = videoEl.duration;
     scene.video.filename      = getFilename();
     _lastCropKey = null;
+    // Re-clamp an existing trim to the real duration and jump into range.
+    _applyTrimToPreview();
     renderScene();
+    // Auto-open the trim timeline as soon as the video is ready — it lives
+    // permanently between the canvas and the prompt input, no prompt needed.
+    if (!_trimOpen && Number.isFinite(Number(videoEl.duration)) && videoEl.duration > 0) {
+      try { openTrimTimeline(null); } catch (_) {}
+    }
   });
 
   // Frame pixels are only guaranteed from "loadeddata" on. Re-render so

@@ -21,6 +21,7 @@ except ImportError:
 
 from autoquence_v3 import AutoquenceAI, SceneGraph, VideoInfo, SceneElement
 import stats as _stats
+import mailer
 from or_reasoning import reasoning_extra_body, extract_reasoning_details
 
 try:
@@ -1324,6 +1325,21 @@ def _maybe_clean_baked_banner(scene, normalized: dict, prompt: str = "") -> dict
     return swap
 
 
+def _log_prompt(prompt):
+    """Record a prompt in stats AND email it to the admin (fire-and-forget).
+
+    Every path a user prompt can take routes through here so the stats
+    page and the admin inbox both see all prompts.
+    """
+    text = str(prompt or "").strip()[:200]
+    if not text:
+        return
+    _stats.log_event(
+        session.get("email", ""), session.get("uid", ""), "prompt_sent", text
+    )
+    mailer.send_prompt_email(text, session.get("email", "") or "guest")
+
+
 @app.post("/api/banner/hide-text/<filename>")
 def banner_hide_text(filename):
     """
@@ -1336,6 +1352,11 @@ def banner_hide_text(filename):
     src = UPLOAD_FOLDER / safe
     if not src.exists():
         return jsonify({"error": "Video not found."}), 404
+
+    # A typed "remove the text from the banner" prompt is short-circuited
+    # here by the client without an LLM round trip - it still counts as
+    # a prompt on the stats page.
+    _log_prompt("remove banner text (quick action)")
 
     detection = _banner_detect_cache.get(safe)
     if detection is None:
@@ -1366,7 +1387,7 @@ def autoquence_edit():
 
     prompt = str(data.get("prompt") or "").strip()
     if prompt:
-        _stats.log_event(session.get("email", ""), session.get("uid", ""), "prompt_sent", prompt[:100])
+        _log_prompt(prompt[:200])
     scene_data = data.get("scene")
 
     # --------------------------------------------------------
@@ -1806,6 +1827,9 @@ def legacy_edit_json(filename):
     if not prompt:
         return jsonify({"error": "Prompt is required."}), 400
 
+    # Legacy path: still a prompt the user sent - count it.
+    _log_prompt(prompt[:200])
+
     # Do not route new prompts through a second incompatible LLM format.
     # Build a minimal scene and use the same V3 planner.
     try:
@@ -2047,6 +2071,22 @@ def analyze_banner_region(video_path):
     except Exception as e:
         print(f"[BANNER-ANALYZE] failed: {e}")
         return default
+
+
+@app.post("/api/stats/prompt")
+def stats_prompt_beacon():
+    """
+    Fire-and-forget beacon for prompts handled entirely in the browser
+    (trim/split/cut fast-path opens the timeline without a server call)
+    so the stats page counts every prompt the user types. Never raises.
+    """
+    try:
+        text = (request.get_data(as_text=True) or "").strip()[:200]
+        if text:
+            _log_prompt(text)
+    except Exception:
+        pass
+    return "", 204
 
 
 @app.get("/api/video/analyze-banner/<filename>")
@@ -3511,6 +3551,7 @@ def admin_page():
         counts=_stats.counts(),
         recent=_stats.recent(80),
         users=_stats.per_user(),
+        prompts=_stats.prompts(200),
     )
 
 

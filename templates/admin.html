@@ -38,11 +38,23 @@
     <p class="sub"><a href="/">← Back to Autoquence</a></p>
 
     <div class="tiles">
-      <div class="tile"><div class="num">{{ counts.signups }}</div><div class="lbl">Sign-ups</div></div>
-      <div class="tile"><div class="num">{{ counts.uploads }}</div><div class="lbl">Uploads</div></div>
       <div class="tile"><div class="num">{{ counts.prompts }}</div><div class="lbl">Prompts</div></div>
+      <div class="tile"><div class="num">{{ counts.uploads }}</div><div class="lbl">Uploads</div></div>
       <div class="tile"><div class="num">{{ counts.exports }}</div><div class="lbl">Exports</div></div>
     </div>
+
+    <h2>All prompts</h2>
+    <table>
+      <tr><th>Prompt</th><th>Who</th><th>When</th></tr>
+      {% for p in prompts %}
+      <tr>
+        <td>{{ p.detail }}</td>
+        <td class="muted">{{ p.email or 'guest' }}</td>
+        <td class="when">{{ p.created_at }}</td>
+      </tr>
+      {% endfor %}
+      {% if not prompts %}<tr><td colspan="3" class="muted">No prompts yet.</td></tr>{% endif %}
+    </table>
 
     <h2>Users</h2>
     <table>
