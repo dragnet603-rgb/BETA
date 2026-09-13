@@ -3552,6 +3552,7 @@ def admin_page():
         recent=_stats.recent(80),
         users=_stats.per_user(),
         prompts=_stats.prompts(200),
+        mailer_status=mailer.mailer_status(),
     )
 
 

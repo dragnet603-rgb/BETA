@@ -95,6 +95,22 @@
       <button id="cropApply"  class="aq-ctrl-btn aq-ctrl-apply">Apply</button>
       <button id="cropCancel" class="aq-ctrl-btn">Cancel</button>
     </div>
+    <!-- Trim timeline: Konva scrub bar + Split/Trim/Apply/Cancel.
+         Takes the prompt box's place while open (same bottom-center spot). -->
+    <div id="trimControls" style="display:none">
+      <div class="trim-time-row">
+        <span id="trimStartLabel">0:00.0</span>
+        <span id="trimRangeLabel"></span>
+        <span id="trimEndLabel">0:00.0</span>
+      </div>
+      <div id="trimTimelineKonva"></div>
+      <div class="trim-btn-row">
+        <button id="trimSplitBtn" class="aq-ctrl-btn">Split</button>
+        <button id="trimBtn" class="aq-ctrl-btn">Trim</button>
+        <button id="trimApplyBtn" class="aq-ctrl-btn aq-ctrl-apply">Apply</button>
+        <button id="trimCancelBtn" class="aq-ctrl-btn">Cancel</button>
+      </div>
+    </div>
     <button id="playPauseBtn" class="play"></button>
 
     <!-- Prompt form -->

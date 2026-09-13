@@ -43,6 +43,17 @@
       <div class="tile"><div class="num">{{ counts.exports }}</div><div class="lbl">Exports</div></div>
     </div>
 
+    <h2>Prompt emailer</h2>
+    <p class="sub">
+      {% if mailer_status.configured %}
+        ✅ Configured — prompts are emailed to <strong>{{ mailer_status.admin }}</strong>.
+        Last result: <strong>{{ mailer_status.last_result or 'no email attempted yet' }}</strong>.
+        {% if mailer_status.last_result and mailer_status.last_result.startswith('failed') %}⚠️ Check the server logs and your Gmail App Password.{% endif %}
+      {% else %}
+        ⚠️ <strong>Not configured</strong> — the GMAIL_APP_PASSWORD env var is missing on this server, so prompt emails are NOT being sent. Add it in your host's environment variables panel (Gmail App Password, 16 chars).
+      {% endif %}
+    </p>
+
     <h2>All prompts</h2>
     <table>
       <tr><th>Prompt</th><th>Who</th><th>When</th></tr>

@@ -857,6 +857,67 @@ border-radius: 50%;
 animation: spin 1s linear infinite;
 }
 /* =========================
+Trim timeline (same color family as crop controls:
+green #2dee06 / greenyellow on dark, rounded pills)
+========================= */
+#trimControls {
+  position: fixed;
+  /* Sits in the gap BETWEEN the canvas and the prompt input bar
+     (prompt wrapper is 4vh + 15px padding ≈ 84px tall). */
+  bottom: calc(2vh + 60px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: 94%;
+  max-width: 430px;
+  
+  border-radius: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 5px 14px;
+  z-index: 9999;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+}
+#trimTimelineKonva {
+  width: 100%;
+  height: 64px;
+  touch-action: none;
+}
+.trim-time-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: #fff;
+  font-family: sans-serif;
+  font-size: 12px;
+}
+
+.trim-btn-row {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+#trimControls .aq-ctrl-btn {
+  background: rgb(66, 63, 63);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 20px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-family: sans-serif;
+  cursor: pointer;
+}
+#trimControls .aq-ctrl-btn:active {
+  transform: scale(0.95);
+}
+#trimControls .aq-ctrl-apply {
+  background: #2dee06;
+  border-color: #2dee06;
+  color: #061206;
+  font-weight: 700;
+}
+/* =========================
 TABLET+
 ========================= */
 @media (min-width: 768px) {

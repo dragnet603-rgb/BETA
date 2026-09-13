@@ -165,8 +165,8 @@ ACTION_REGISTRY = {
         "optional": ["speed"],
     },
     "trim_video": {
-        "description": "Trim video to time range.",
-        "optional": ["start", "end"],
+        "description": "Trim video to time range. Use seconds + position words.",
+        "optional": ["start", "end", "seconds", "position"],
     },
     "set_background": {
         "description": "Change canvas background color.",
@@ -640,6 +640,27 @@ COMBINED PROMPTS (crop + other edits in one message):
     include all the non-crop actions (banner/text/etc.), just NOT crop_video.
     The frontend will show clickable ratio buttons.
 
+TRIM - cut/trim/remove N seconds (video length):
+  The trim model keeps ONE continuous range [start, end] in seconds.
+  "cut the first N seconds" (also: beginning, from the start, opening, intro)
+  -> trim_video action with properties {seconds: N, position: "first"}.
+  The client computes start=N, end=duration.
+  "cut the last N seconds" (also: end, ending, off the end, outro)
+  -> trim_video action with properties {seconds: N, position: "last"}.
+  The client computes start=0, end=duration-N.
+  "cut the middle N seconds" -> keep ONLY the centered N seconds:
+  trim_video action with properties {seconds: N, position: "middle"}.
+  Bare "split", "open the timeline", or a trim request the client should
+  handle visually -> response_type "clarification" with actions [] and a
+  message containing the exact words "open the timeline".
+  Bare amount with NO position ("cut 5 seconds", "trim 10 sec", "remove 3s")
+  -> response_type "clarification", actions [], include "seconds": N.
+  Message asks in plain text: which part - first, middle, or last?
+  (The user answers by typing; there are NO buttons.)
+  Duration parsing: bare number = seconds; "1:30" -> 90; "2 minutes" -> 120.
+  NEVER invent start/end seconds yourself - pass seconds + position and let
+  the client compute exact start/end from the live video duration.
+
 NEVER for:
   "make the banner pink"     → style_element only
   "use Impact"               → style_element only
@@ -767,6 +788,10 @@ You MUST return a JSON object (no markdown, no code blocks, raw JSON only):
 If response_type is "clarification" or "conversation": actions may be empty.
 For "crop_choice": actions contain ONLY the non-crop actions already performed;
 the crop itself is chosen by the user from ratio buttons in the UI.
+For a bare trim amount (no first/middle/last): use response_type
+"clarification" with actions [], include "seconds": <number>, and ask in
+plain text which part - first, middle, or last. The user answers by typing
+(e.g. "first"); NEVER add buttons - the existing AQ response bubble is the UI.
 
 ==========================================================================
 IMPORTANT RULES
@@ -1406,9 +1431,33 @@ class SceneExecutor:
                 elif action.action == "set_speed":
                     new_scene.canvas["speed"] = float(action.properties.get("speed", 1.0))
                 elif action.action == "trim_video":
+                    props = action.properties or {}
+                    start = props.get("start")
+                    end = props.get("end")
+                    # New seconds+position form: keep it so the client can
+                    # compute exact start/end from the live video duration.
+                    # If position + seconds + known duration, also resolve now.
+                    seconds = props.get("seconds")
+                    position = (props.get("position") or "").lower() or None
+                    if (start is None or end is None) and seconds is not None and position:
+                        try:
+                            secs = float(seconds)
+                        except (TypeError, ValueError):
+                            secs = None
+                        dur = (scene.video.duration if scene.video else None) or 0
+                        if secs is not None and secs > 0 and dur and dur > 0:
+                            if position == "first":
+                                start, end = secs, dur
+                            elif position == "last":
+                                start, end = 0, max(0.0, dur - secs)
+                            elif position == "middle":
+                                mid = dur / 2.0
+                                start, end = max(0.0, mid - secs / 2.0), min(dur, mid + secs / 2.0)
                     new_scene.canvas["trim"] = {
-                        "start": action.properties.get("start"),
-                        "end":   action.properties.get("end"),
+                        "start": start,
+                        "end":   end,
+                        "seconds": seconds,
+                        "position": position,
                     }
                 elif action.action == "set_background":
                     new_scene.canvas["background"] = action.properties.get("color")

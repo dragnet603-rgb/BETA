@@ -33,12 +33,32 @@ def _admin_email():
     return os.getenv("ADMIN_EMAIL", "temiolajide108@gmail.com").strip()
 
 
+_last_result = None  # updated by the background sender thread
+
+
+def mailer_status():
+    """Admin diagnostics: is the mailer configured, and has it worked?
+
+    Returns a dict with:
+      configured : GMAIL_APP_PASSWORD and admin email are both set
+      admin      : address the emails are sent to
+      last_result: None (nothing sent yet), "sent", or the failure reason
+    """
+    return {
+        "configured": bool(os.getenv("GMAIL_APP_PASSWORD", "").strip()) and bool(_admin_email()),
+        "admin": _admin_email(),
+        "last_result": _last_result,
+    }
+
+
 def send_prompt_email(prompt, who=""):
     """Email one prompt to the admin. Fire-and-forget; never raises."""
+    global _last_result
     password = os.getenv("GMAIL_APP_PASSWORD", "").strip()
     addr = _admin_email()
     text = str(prompt or "").strip()
     if not password or not addr or not text:
+        _last_result = "skipped: mailer not configured (GMAIL_APP_PASSWORD missing)" if not password else "skipped: empty prompt"
         return
 
     def _send():
@@ -55,7 +75,10 @@ def send_prompt_email(prompt, who=""):
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
                 smtp.login(addr, password)
                 smtp.send_message(msg)
+            _last_result = f"sent at {datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+            print("[MAIL] prompt email sent")
         except Exception as exc:  # noqa: BLE001 - mail must never break the app
+            _last_result = f"failed: {exc}"
             print(f"[MAIL] prompt email failed: {exc}")
 
     threading.Thread(target=_send, daemon=True).start()
