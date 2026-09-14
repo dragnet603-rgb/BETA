@@ -25,10 +25,11 @@
         person_profiles: 'always',
         capture_pageview: true,
         capture_pageleave: true,
-        // Explicit session replay with typed prompts visible (inputs are
-        // masked by default, so prompt text would otherwise be hidden).
-        // Passwords stay masked.
+        // Explicit session replay with typed prompts visible. maskAllInputs
+        // must be false — the 2026-05-30 defaults preset masks ALL inputs
+        // by default, and maskInputOptions alone does not disable that.
         session_recording: {
+            maskAllInputs: false,
             maskInputOptions: { password: true },
         },
     })
