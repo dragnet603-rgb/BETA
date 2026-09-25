@@ -123,6 +123,7 @@ code, resp = http(f"/sync/beats/{job}")
 assert code == 200 and resp.get("beats"), (code, resp)
 code, resp = http(f"/sync/status/{job}")
 assert code == 200 and resp["status"] == "ready", (code, resp)
+assert resp.get("updated_at"), "status payload must carry updated_at"
 print("3. /sync/beats + /sync/status serve adopted transcript OK")
 
 # ── 4. second adoption refused (server transcript authoritative) ───────

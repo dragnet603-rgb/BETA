@@ -653,6 +653,20 @@ def manifest_image_warning(manifest, job_id):
     return sync_image_warning(job_id)
 
 
+def _log_transcribe_event(event, detail):
+    """Best-effort stats event for transcription timing (never raises).
+
+    Makes slow server runs diagnosable from stats.db: every worker run
+    logs `transcribe_done | <job> <N>s audio in <M>s wall` (or
+    `transcribe_failed | ... after <M>s: <error>`).
+    """
+    try:
+        import stats as _stats
+        _stats.log_event("", "", event, detail)
+    except Exception:  # noqa: BLE001 - stats must not break transcription
+        pass
+
+
 def start_transcription_job(job_id: str):
     """Run Whisper in a background thread; manifest flips to ready/error."""
     manifest = load_manifest(job_id)
@@ -664,6 +678,7 @@ def start_transcription_job(job_id: str):
     audio_file = job_dir(job_id) / manifest["audio"]
 
     def _worker():
+        started = time.time()
         try:
             # Transcribe a normalized copy; the original stays as the
             # render's mux source.
@@ -698,11 +713,26 @@ def start_transcription_job(job_id: str):
             m["status"] = "ready"
             m["error"] = None
             save_manifest(job_id, m)
+            _log_transcribe_event(
+                "transcribe_done",
+                f"{job_id} {audio_duration:.0f}s audio in "
+                f"{time.time() - started:.0f}s wall",
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced to the client
+            # Log FIRST: if the job dir vanished (job deleted mid-run) the
+            # save below raises, and the timing event must still land.
+            _log_transcribe_event(
+                "transcribe_failed",
+                f"{job_id} after {time.time() - started:.0f}s: {exc}",
+            )
             m = load_manifest(job_id) or manifest
             m["status"] = "error"
             m["error"] = str(exc)
-            save_manifest(job_id, m)
+            try:
+                save_manifest(job_id, m)
+            except Exception as save_exc:  # noqa: BLE001
+                print(f"[sync] could not persist error state for "
+                      f"{job_id}: {save_exc}")
 
     threading.Thread(target=_worker, daemon=True).start()
 

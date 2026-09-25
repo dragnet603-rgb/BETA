@@ -287,7 +287,9 @@
   // Boot: poll the job status
   // ─────────────────────────────────────────────────────────────
   async function boot() {
-    const deadline = Date.now() + 3 * 60 * 1000; // transcription cap
+    // Generous cap: on a fresh deploy/cold start the server may need to
+    // load (or re-download) Whisper before the first transcription lands.
+    const deadline = Date.now() + 8 * 60 * 1000; // transcription cap
     while (Date.now() < deadline) {
       let data;
       try {
@@ -338,8 +340,9 @@
 
       await new Promise((r) => setTimeout(r, 1500));
     }
-    showMsg("Timed out waiting for the voiceover - you can still build "
-      + "the slideshow.", true);
+    showMsg("Timed out waiting for the voiceover - if the site was just "
+      + "restarted the server may still be warming up; reload in a minute "
+      + "or build the slideshow now.", true);
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -1883,7 +1886,7 @@
 
   /**
    * Poll /sync/status until the transcription leaves
-   * transcribing/processing - same cadence (1.5s) and cap (3 min) as
+   * transcribing/processing - same cadence (1.5s) and cap (8 min) as
    * boot(). Each poll feeds applyServerData + render, so the timeline
    * underneath updates the moment the segments arrive, exactly as a
    * page load would. Resolves {outcome, message}:
@@ -1894,7 +1897,9 @@
    *   cancelled - Cancel was tapped (transcription keeps running)
    */
   async function waitForTranscription() {
-    const deadline = Date.now() + 3 * 60 * 1000;   // same cap as boot()
+    // Generous cap (same as boot()): a deploy cold start can spend
+    // minutes loading the model before transcription itself begins.
+    const deadline = Date.now() + 8 * 60 * 1000;
     const started = Date.now();
     while (Date.now() < deadline) {
       if (!beatsWaiting) return { outcome: "cancelled", message: "" };
@@ -1928,15 +1933,19 @@
 
       const secs = Math.round((Date.now() - started) / 1000);
       if (beatsProgressText) {
-        beatsProgressText.textContent = secs > 0
-          ? `Transcribing voiceover… (${secs}s)`
-          : "Transcribing voiceover…";
+        beatsProgressText.textContent = secs > 90
+          ? `Transcribing voiceover… (${secs}s) - a cold start after a `
+            + "deploy can take a few minutes"
+          : secs > 0
+            ? `Transcribing voiceover… (${secs}s)`
+            : "Transcribing voiceover…";
       }
       await new Promise((r) => setTimeout(r, 1500));
     }
     return {
       outcome: "timeout",
-      message: "Timed out waiting for the voiceover - tap Generate beats "
+      message: "Still transcribing after 8 minutes - if the site was just "
+        + "deployed the server may still be warming up. Tap Generate beats "
         + "again in a moment.",
     };
   }

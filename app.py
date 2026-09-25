@@ -66,9 +66,12 @@ app.config["PROMPTS_FOLDER"] = str(PROMPTS_FOLDER)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 
 # Transcription engine warm-up: prod runs under gunicorn (no __main__),
-# so the Whisper model is preloaded on the first request instead — the
-# app is live by then and the one-time model load happens off the
-# request path in a background thread.
+# so the model load is kicked off AT PROCESS START in a background
+# thread - the first visitor never pays it, and gunicorn's worker
+# recycle (--max-requests) re-warms the same way. The before_request
+# hook below remains a safety net if the start-up thread was lost.
+sync_pipeline.warm_whisper()
+
 _APP_WARMED = False
 
 
@@ -1236,6 +1239,9 @@ def _sync_status_payload(job_id, manifest):
     adoption route so the page can apply it exactly like a status poll."""
     response = {
         "status": manifest.get("status", "unknown"),
+        # When the manifest last changed: lets the UI (and post-mortems)
+        # tell a slow-but-alive transcription from a dead one.
+        "updated_at": manifest.get("updated_at"),
         "matched": manifest.get("matched"),
         "error": manifest.get("error"),
         "warning": manifest.get("sync_warning"),
