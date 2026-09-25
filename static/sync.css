@@ -1,0 +1,1146 @@
+/* ============================================================
+   SYNC PAGE — timeline + preview for image/voiceover jobs.
+   Reuses canvas.css base (dark bg, pills, green accents).
+   ============================================================ */
+
+/* One width variable drives every panel so they stay aligned.
+   --chrome-h: fixed vertical chrome (header padding, toolbar, timeline,
+   action row, margins) measured from the stacked layout. */
+:root {
+  --panel-w: min(92vw, 480px);
+  --chrome-h: 360px;
+}
+
+/* Fixed app shell: the sync page never scrolls vertically. The panels
+   absorb the leftover height instead. On very short screens (phone
+   landscape) the max-height queries below restore scrolling. */
+body {
+  justify-content: flex-start;
+  height: 100dvh;
+  overflow: hidden;
+  padding-top: 60px;
+}
+
+/* Tablets (641-1099px): the whole stack — canvas, play button, timeline,
+   buttons — floats as ONE group, vertically centered on the screen.
+   No bottom pinning here (that's desktop/mobile behavior, not tablet).
+   1099 covers iPad Pro 13 (M4), whose portrait viewport is 1032px —
+   the old 1024 cutoff missed it by 8px and dumped it into the desktop
+   layout. */
+@media (min-width: 641px) and (max-width: 1099px) {
+  body {
+    justify-content: center;  /* centers the entire stack */
+  }
+
+  .sync-canvas {
+    margin-top: 0;
+  }
+
+  #syncToolbar {
+    margin-bottom: 0;
+  }
+
+  #syncTimeline {
+    margin-top: 0;
+  }
+}
+
+/* Laptops + desktops (1100px+): the canvas + play toolbar sit perfectly
+   CENTERED in the space between the header and the bottom-pinned timeline
+   (margin-top:auto + margin-bottom:auto split the free space evenly), so
+   stretching the window moves the group toward the middle instead of the
+   far top, and shrinking lets the gaps collapse gracefully. Mobile keeps
+   its own values in the max-width: 640px block at the bottom of this
+   file. */
+@media (min-width: 1100px) {
+  body {
+    padding-top: 24px;    /* safety floor, not the position */
+    padding-bottom: 12px;
+  }
+
+  .sync-canvas {
+    margin-top: auto;     /* free space splits evenly: half above… */
+  }
+
+  #syncToolbar {
+    margin-bottom: auto;  /* …half below the play toolbar */
+  }
+
+  #syncTimeline {
+    margin-top: 0;        /* the toolbar's auto now does the pinning */
+  }
+}
+
+/* Preview and timeline share ONE width. The height-aware term converts
+   leftover vertical space into the widest 16:9 box that fits, so the
+   preview shrinks on short screens instead of clipping the panels. */
+.sync-canvas {
+  width: max(240px, min(var(--panel-w), calc((100dvh - var(--chrome-h)) * 16 / 9)));
+  margin-bottom: 10px;
+}
+
+/* Every panel is capped at the SAME outer width as the preview, so its
+   padding must live INSIDE the cap (default content-box would add the
+   padding on top and make the timeline 24px wider than the canvas).
+   The body rule keeps the fixed shell exactly 100dvh tall including the
+   header padding, so the page can never scroll. */
+body,
+#syncToolbar,
+#syncTimeline,
+#syncActions,
+.sync-dialog,
+.prompt-card,
+.sync-media-btn {
+  box-sizing: border-box;
+}
+
+#syncPreviewImg {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: 10px; 
+  background: #353333 !important;
+  outline: none;
+   
+   
+
+}
+
+/* Play/pause button - fully restyled for the sync page. The canvas-page
+   .play styles (absolute + 110px translate offset) assume it lives inside
+   .canvas-container; here it sits in normal flow under the preview. */
+#syncPlayBtn {
+  position: static;
+  transform: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 44px;
+  height: 44px;
+  margin: 0 auto;
+  
+  border-radius: 50%;
+  
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#syncPlayBtn:active {
+  background: rgb(60, 60, 60);
+  transform: scale(0.92);
+}
+
+#syncPlayBtn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* Play triangle */
+#syncPlayBtn::before {
+  content: "";
+  position: static;
+  transform: none;
+  border-top: 9px solid transparent;
+  border-bottom: 9px solid transparent;
+  border-left: 14px solid white;
+  margin-left: 3px;
+}
+
+/* Pause: two vertical bars (.active matches the canvas-page convention) */
+#syncPlayBtn.active::before {
+  border: none;
+  width: 5px;
+  height: 18px;
+  background: white;
+  transform: none;
+  margin: 0;
+}
+
+#syncPlayBtn.active::after {
+  content: "";
+  position: static;
+  transform: none;
+  width: 5px;
+  height: 18px;
+  background: white;
+}
+
+/* ---------------- Timeline panel ---------------- */
+#syncTimeline {
+  width: var(--panel-w);
+  
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 12px;
+  background: rgba(48, 44, 44, 0.9);
+ 
+  border-radius: 20px;
+  margin-bottom: 10px;
+}
+
+/* ---------------- Preview media toolbar ----------------
+   White minimal icons overlaid on the top-right of the 16:9 preview.
+   .canvas-container is position:relative so this anchors to it. */
+/* Toolbar above the timeline: add images (left) | play (center) | add
+   voiceover (right). Same width and pill style as the timeline panel so
+   they read as one unit; the play button's margin:auto centers it. */
+#syncToolbar {
+  width: var(--panel-w);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 14px;
+  
+  border-radius: 20px;
+  margin-bottom: 12px;
+}
+
+/* The old overlay position is gone - buttons live in #syncToolbar now. */
+#syncMediaBar {
+  display: none;
+}
+
+.sync-media-btn {
+  position: relative;
+  width: auto;
+  min-width: 44px;
+  height: auto;
+  padding: 4px 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  border: 2px solid transparent;
+  background: transparent;
+  color: #fff;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 0.1s ease, background 0.15s ease;
+  backdrop-filter: blur(4px);
+}
+
+.sync-media-btn:active {
+  transform: scale(0.92);
+  background: rgba(0, 0, 0, 0.75);
+}
+
+.sync-media-btn svg {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+}
+
+/* Icon wrapper + caption: the caption sits directly under each icon. */
+.sync-btn-icon {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sync-btn-label {
+  font-family: sans-serif;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.75);
+  white-space: nowrap;
+  text-align: center;
+}
+
+/* ---------------- Timeline: lanes + shared scroll viewport ----------------
+   #syncLanes  = fixed label column + one scroll viewport
+   #syncScroll = the only horizontally scrollable element, so the image,
+                 audio and ruler lanes always stay in lockstep
+   #syncLaneStack = the lanes, sized by JS to duration * PX_PER_SECOND
+                 (min-width:100% keeps a short timeline filling the panel,
+                 with the unused part showing as plain background) */
+#syncLanes {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.sync-label-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.sync-track-label {
+  width: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  color: #8a8f98;
+  font-family: sans-serif;
+  font-size: 11px;
+  text-align: right;
+}
+
+/* Label heights mirror the lane heights so the columns line up. */
+.sync-track-label:nth-child(1) { height: 54px; }
+.sync-track-label:nth-child(2) { height: 46px; }
+.sync-label-ruler { height: 14px; }
+
+#syncScroll {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+  -webkit-overflow-scrolling: touch;
+}
+
+#syncScroll::-webkit-scrollbar {
+  height: 6px;
+}
+
+#syncScroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 3px;
+}
+
+#syncLaneStack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 100%;
+}
+
+.sync-track {
+  position: relative;
+  height: 46px;
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  align-items: stretch;
+}
+
+/* Image blocks: width proportional to segment duration */
+.sync-img-block {
+  position: relative;
+  flex-shrink: 0;
+  min-width: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-right: 1px solid rgba(255, 255, 255, 0.35);
+  background-size: cover;
+  background-position: center;
+  cursor: grab;
+  transition: filter 0.15s;
+}
+
+.sync-img-block:hover {
+  filter: brightness(1.15);
+}
+
+.sync-img-block.drag-over {
+  outline: 2px solid #2dee06;
+  outline-offset: -2px;
+}
+
+.sync-img-block.unmatched {
+  background: repeating-linear-gradient(
+    45deg, #2a2a2a, #2a2a2a 6px, #1f1f1f 6px, #1f1f1f 12px
+  );
+}
+
+.sync-img-block .seg-text {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 2px 4px;
+  font-family: sans-serif;
+  font-size: 9px;
+  line-height: 1.2;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.65);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.sync-img-block .seg-actions {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  display: none;
+  gap: 2px;
+}
+
+.sync-img-block:hover .seg-actions {
+  display: flex;
+}
+
+.seg-actions button {
+  border: none;
+  border-radius: 6px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-family: sans-serif;
+  background: rgba(66, 63, 63, 0.95);
+  color: #fff;
+  cursor: pointer;
+}
+
+.seg-actions button:hover {
+  background: #2dee06;
+  color: #061206;
+}
+
+/* Audio track */
+.sync-audio-block {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  max-width: 100%;
+  /* background: linear-gradient(90deg, rgba(45, 238, 6, 0.25), rgba(2, 240, 41, 0.12)); */
+  color: #baffb0;
+  font-family: sans-serif;
+  font-size: 12px;
+  border-radius: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* Empty state: tap-to-pick voiceover chip (CapCut-style) */
+.sync-audio-block.add-voiceover {
+  cursor: pointer;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  margin: 6px;
+  border: 1px dashed rgba(45, 238, 6, 0.5);
+  border-radius: 12px;
+  transition: background 0.15s;
+}
+
+.sync-audio-block.add-voiceover:hover {
+  background: rgba(45, 238, 6, 0.18);
+}
+
+.sync-audio-block .chipTitle {
+  color: #e8eaf0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* Loaded voiceover: filename + duration over a green waveform. */
+.sync-audio-block .waveCanvas {
+  width: 100%;
+  height: 40px;
+  display: block;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.sync-audio-block .chipTitle,
+.sync-audio-block .chipSub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.sync-audio-block .chipSub {
+  color: #8a8f98;
+  font-size: 11px;
+}
+
+/* Time ruler */
+.sync-ruler {
+  width: 100%;
+  position: relative;
+  height: 16px;
+  font-family: sans-serif;
+  font-size: 9px;
+  color: #8a8f98;
+}
+
+.sync-ruler span {
+  position: absolute;
+  transform: translateX(-50%);
+  border-left: 1px solid rgba(255, 255, 255, 0.15);
+  padding-left: 3px;
+}
+
+.beat-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: rgba(45, 238, 6, 0.85);
+  z-index: 4;
+  pointer-events: none;
+}
+
+/* Diamond flag on top of each marker */
+.beat-marker::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -3px;
+  width: 8px;
+  height: 8px;
+  background: #2dee06;
+  transform: rotate(45deg);
+}
+
+/* Ghost tick: the TYPED script timestamp when it differs from the real
+   sentence start that actually drives the switch. */
+.beat-marker.ghost {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.beat-marker.ghost::before {
+  background: rgba(255, 255, 255, 0.55);
+}
+
+/* Playhead */
+#syncPlayhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #2dee06;
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* Mismatch banner */
+.sync-mismatch {
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(255, 190, 60, 0.12);
+  border: 1px solid rgba(255, 190, 60, 0.45);
+  color: #ffd98a;
+  font-family: sans-serif;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.sync-mismatch strong {
+  color: #ffce6e;
+}
+
+/* Status/errors: popup with a Cancel button (replaces the old pill). */
+.sync-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  width: min(86vw, 360px);
+  padding: 18px 20px;
+  background: rgba(38, 36, 36, 0.98);
+  border-radius: 16px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+
+.sync-dialog-text {
+  margin: 0;
+  color: #f2f2f2;
+  font-family: sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.sync-dialog.error .sync-dialog-text {
+  color: #ffb4b4;
+}
+
+.sync-dialog-cancel {
+  padding: 8px 26px;
+  border: none;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-family: sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.sync-dialog-cancel:active {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* ---------------- Rendering state ----------------
+   No floating progress card: while the video renders the preview
+   blurs and a sharp "Rendering your video" label sits over it. */
+#syncPreviewImg {
+  transition: filter 0.25s ease;
+}
+
+.sync-canvas.rendering #syncPreviewImg {
+  filter: blur(10px);
+}
+
+.sync-render-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(2, 2, 2, 0.35);
+  border-radius: 20px;
+  pointer-events: none;
+}
+
+.sync-render-overlay p {
+  margin: 0;
+  color: #ffffff;
+  font-family: sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.85);
+}
+
+/* ---------------- Export (top-right corner) ----------------
+   Always visible: it renders the video and downloads the MP4 in one
+   tap; dimmed while a render is running. */
+.sync-download-btn {
+  position: fixed;
+  top: 3vw;
+  right: 3vw;
+  z-index: 50;
+  padding: 11px 22px;
+  border-radius: 20px;
+  background: #2dee06;
+  color: #061206;
+  font-family: sans-serif;
+  font-size: 14px;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+  transition: transform 0.1s ease;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+
+.sync-download-btn:active {
+  transform: scale(0.95);
+}
+
+/* While a render runs: dimmed; sync.js also ignores taps while busy. */
+.sync-download-btn.busy {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* Suggested assignment (image count != segment count): still visible and
+   draggable, dimmed until the user confirms with Auto-match. */
+.sync-img-block.provisional {
+  opacity: 0.55;
+  border-style: dashed;
+}
+
+/* Auto-match button inside the mismatch banner */
+#syncAutoMatch {
+  display: block;
+  margin-top: 10px;
+  padding: 9px 18px;
+  border: none;
+  border-radius: 20px;
+  background: #2dee06;
+  color: #061206;
+  font-family: sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+#syncAutoMatch:active {
+  transform: scale(0.96);
+}
+
+/* Tracks and ruler are scrubbable: tap to seek */
+.sync-track,
+.sync-ruler {
+  cursor: pointer;
+}
+/* ============================================================
+   IMAGE-DRIVEN TIMELINE
+   Blocks hold a real <img> thumbnail so every uploaded image is
+   visible the moment the page loads, before any transcription.
+   touch-action:none is required for Pointer-Event dragging on
+   touch screens (HTML5 drag-and-drop cannot work there at all).
+   ============================================================ */
+
+#syncImageTrack {
+  height: 54px;
+  align-items: stretch;
+}
+
+.sync-img-block {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: stretch;
+  background-color: rgba(255, 255, 255, 0.04);
+  /* Filmstrip: the picture is painted at a constant scale driven by the
+     lane height, repeating horizontally. Lengthening a clip only reveals
+     more copies — the photo itself never magnifies. */
+  background-repeat: repeat-x;
+  background-size: auto 100%;
+  background-position: left center;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Index number, top-left */
+.sync-img-block .blockNum {
+  position: absolute;
+  top: 2px;
+  left: 3px;
+  padding: 0 4px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-family: sans-serif;
+  font-size: 9px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+/* Duration, bottom-left */
+.sync-img-block .blockDur {
+  position: absolute;
+  left: 3px;
+  bottom: 2px;
+  padding: 0 4px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #2dee06;
+  font-family: sans-serif;
+  font-size: 9px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+/* Right-edge grab strip: drag to change how long the image shows */
+.sync-img-block .blockHandle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  cursor: ew-resize;
+  touch-action: none;
+  background: linear-gradient(
+    to right,
+    rgba(0, 0, 0, 0),
+    rgba(45, 238, 6, 0.35)
+  );
+}
+
+.sync-img-block.selected {
+  outline: 2px solid #2dee06;
+  outline-offset: -2px;
+  z-index: 3;
+}
+
+.sync-img-block.dragging {
+  opacity: 0.75;
+  z-index: 10;
+  cursor: grabbing;
+}
+
+.sync-img-block.insert-before {
+  outline: 2px dashed #2dee06;
+  outline-offset: -2px;
+}
+
+/* Images-only jobs: no timestamps yet, so keep the block readable */
+.sync-img-block.provisional {
+  opacity: 0.85;
+}
+
+.sync-img-block.unmatched {
+  background: repeating-linear-gradient(
+    45deg, #2a2a2a, #2a2a2a 6px, #1f1f1f 6px, #1f1f1f 12px
+  );
+}
+
+/* ============================================================
+   ACTION ROW — below the timeline: add image | add audio |
+   add prompt | generate beats. Each .sync-media-btn stacks its
+   icon above a small name label (.sync-btn-label), and the four
+   controls still read as one set. (Build video moved into the
+   always-visible Export button, top right.)
+   ============================================================ */
+
+#syncActions {
+  width: var(--panel-w);
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 2px;
+  background: transparent;
+  border-radius: 20px;
+  margin-bottom: 8px;
+}
+
+.sync-media-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.sync-secondary-btn {
+  width: 100%;
+  padding: 11px 20px;
+  border: 1px solid rgba(45, 238, 6, 0.5);
+  border-radius: 20px;
+  background: rgba(45, 238, 6, 0.1);
+  color: #b6ffa6;
+  font-family: sans-serif;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.sync-secondary-btn:active {
+  background: rgba(45, 238, 6, 0.22);
+}
+
+/* Voiceover chip on the audio track */
+.sync-audio-block.add-voiceover {
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* Advisory note that survives status updates (see renderNote): the
+   duplicate-picture case. Amber, not red - the timing is exact. */
+.sync-note {
+  width: var(--panel-w);
+  margin: -2px 0 8px;
+  padding: 6px 8px;
+  border-left: 3px solid #e0a430;
+  background: rgba(224, 164, 48, 0.12);
+  border-radius: 4px;
+  color: #f0d9a8;
+  font-family: sans-serif;
+  font-size: 11.5px;
+  line-height: 1.4;
+  text-align: left;
+}
+
+/* ============================================================
+   ADD PROMPT MODAL — paste a timestamped script; Apply retimes
+   the timeline. Parse errors show inline in .prompt-error.
+   ============================================================ */
+
+.prompt-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.prompt-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(92vw, 460px);
+  max-height: 86vh;
+  overflow-y: auto;
+  padding: 18px;
+  background: rgba(48, 44, 44, 0.98);
+  border-radius: 20px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+}
+
+.prompt-card h2 {
+  margin: 0;
+  color: #f2f2f2;
+  font-family: sans-serif;
+  font-size: 16px;
+}
+
+.prompt-hint {
+  margin: 0;
+  color: #8a8f98;
+  font-family: sans-serif;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.prompt-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 150px;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.4);
+  color: #f2f5f2;
+  font-family: Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.prompt-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.prompt-cancel {
+  padding: 9px 22px;
+  border: none;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-family: sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.prompt-cancel:active {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.prompt-apply {
+  padding: 9px 24px;
+  border: none;
+  border-radius: 99px;
+  background: #2dee06;
+  color: #061206;
+  font-family: sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.prompt-apply:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Inline parse/validation errors under the textarea. */
+.prompt-error {
+  margin: -4px 0 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(255, 96, 96, 0.12);
+  color: #ff8f8f;
+  font-family: sans-serif;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+/* ============================================================
+   GENERATE BEATS POPUP — the existing beat plan presented as ONE
+   copyable prompt. Copy button mirrors the Apply pill but carries a
+   clipboard (paste) icon + label so the whole prompt copies in a tap.
+   ============================================================ */
+
+.prompt-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 9px 22px;
+  border: none;
+  border-radius: 99px;
+  background: #2dee06;
+  color: #061206;
+  font-family: sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.prompt-copy:active {
+  background: #25c405;
+}
+
+.prompt-copy:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.prompt-copy svg {
+  width: 15px;
+  height: 15px;
+  pointer-events: none;
+}
+
+/* The beat prompt is generated, not typed: slightly dimmer text says
+   "copy me" — Add prompt stays the editor for it. */
+.prompt-textarea[readonly] {
+  color: #d9ded9;
+  cursor: text;
+}
+
+/* ============================================================
+   APPLY PROGRESS POPUP — staged updates after Apply is pressed
+   (loading -> prompt received -> detected X timestamps ->
+   loading X images -> saved). Sits ABOVE the Add prompt modal
+   (z-index 10002 vs 10001) so it owns the screen while the run
+   is in flight; Cancel lives INSIDE the card, never at the
+   bottom of the page.
+   ============================================================ */
+
+.prompt-progress {
+  position: fixed;
+  inset: 0;
+  z-index: 10002;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.prompt-progress-card {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  width: min(92vw, 380px);
+  padding: 22px 20px;
+  background: rgba(48, 44, 44, 0.98);
+  border-radius: 20px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+}
+
+/* Ring spinner: hidden once the run reaches a terminal state
+   (success/error) via the .prompt-progress-done class. */
+.prompt-progress-spinner {
+  box-sizing: border-box;
+  width: 44px;
+  height: 44px;
+  border: 3px solid rgba(255, 255, 255, 0.15);
+  border-top-color: #2dee06;
+  border-radius: 50%;
+  animation: promptSpin 0.85s linear infinite;
+}
+
+.prompt-progress-done .prompt-progress-spinner {
+  display: none;
+}
+
+@keyframes promptSpin {
+  to { transform: rotate(360deg); }
+}
+
+.prompt-progress-text {
+  margin: 0;
+  color: #f2f2f2;
+  font-family: sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  text-align: center;
+  white-space: pre-line;
+}
+
+/* Terminal error state: the message turns red inside the popup
+   (the bottom hint line never carries Apply results anymore). */
+.prompt-progress-error .prompt-progress-text {
+  color: #ffb4b4;
+}
+
+/* The audio element never renders controls on this page — keep it out
+   of the fixed-height flex column entirely. */
+#syncAudio {
+  display: none;
+}
+
+/* ---------------- Short screens ----------------
+   Height-driven steps: shrink the shared width cap, then tighten
+   vertical chrome, then (phone landscape) let the page scroll
+   instead of clipping the action row. */
+@media (max-height: 740px) {
+  :root {
+    --panel-w: min(88vw, 420px);
+  }
+
+  body {
+    padding-top: 52px;
+  }
+}
+
+@media (max-height: 640px) {
+  .sync-canvas {
+    margin-bottom: 6px;
+  }
+
+  #syncToolbar {
+    padding: 4px 14px;
+    margin-bottom: 8px;
+  }
+
+  #syncTimeline {
+    gap: 2px;
+    padding: 4px 10px;
+    margin-bottom: 6px;
+  }
+
+  #syncActions {
+    padding: 4px 16px;
+    margin-bottom: 6px;
+  }
+}
+
+@media (max-height: 500px) {
+  /* Phone landscape: the stacked panels exceed any fixed shell, so
+     the page scrolls vertically rather than clipping controls. */
+  body {
+    height: auto;
+    min-height: 100dvh;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+}
+
+/* ---------------- Mobile: top preview, bottom controls ----------------
+   margin-top:auto on the timeline pushes it (plus the action row that
+   follows it) to the bottom of the fixed-height shell, so the leftover
+   space lands in the middle: the preview + play toolbar sit just under
+   the header at the top, and the timeline + buttons hug the bottom. */
+@media (max-width: 640px) {
+  body {
+    padding-top: 140px;    /* canvas + play pushed a little lower */
+    padding-bottom: 10px; /* buttons end just above the screen edge */
+  }
+
+  #syncTimeline {
+    margin-top: auto;     /* pins timeline + buttons to the bottom */
+  }
+
+  #syncActions {
+    margin-bottom: 0;     /* body padding-bottom provides the edge gap */
+  }
+}

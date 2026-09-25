@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>Sync - Autoquence</title>
+    <link rel="icon" type="image/png" href="{{ static_v('images/autoquence.png') }}" />
+    <link rel="stylesheet" href="{{ static_v('canvas.css') }}" />
+    <link rel="stylesheet" href="{{ static_v('sync.css') }}" />
+  </head>
+  <body>
+    <div class="promptrText">
+      <a href="{{ url_for('index') }}" style="text-decoration: none; color: inherit;">
+  <h1>Autoquence</h1>
+</a>
+      
+    </div>
+
+    <!-- 16:9 preview: shows the image for the current moment -->
+    <div class="canvas-container sync-canvas">
+      <div class="canvas">
+        <img id="syncPreviewImg" preload="auto"  alt="" />
+        <!-- Rendering state: preview blurs, this label stays sharp on top. -->
+        <div id="syncRenderOverlay" class="sync-render-overlay" style="display: none" aria-live="polite">
+          <p id="syncRenderText">Rendering your video…</p>
+        </div>
+      </div>
+    </div>
+    <input
+      type="file"
+      id="syncImageInput"
+      accept="image/*"
+      multiple
+      style="display: none"
+    />
+
+    <!-- Play keeps its normal spot: centered between the preview and the
+         timeline. Media/prompt controls live below the timeline. Export
+         (top right) renders the video and downloads it. -->
+    <div id="syncToolbar">
+      <button id="syncPlayBtn" class="play" title="Play / pause" aria-label="Play / pause preview"></button>
+    </div>
+
+    <!-- Timeline: image lane (top) + audio lane (bottom) + ruler.
+         One scroll viewport holds all three lanes so they can never drift
+         apart; the label column stays fixed beside it. Block widths are a
+         constant pixels-per-second, so adding images lengthens the timeline
+         (scroll to see the rest) instead of squeezing the existing blocks. -->
+    <div id="syncTimeline">
+      <!-- <div id="syncMismatch" class="sync-mismatch" style="display: none"></div> -->
+      <div id="syncLanes">
+        <div class="sync-label-col">
+          <span class="sync-track-label">Images</span>
+          <span class="sync-track-label">Audio</span>
+          <span class="sync-track-label sync-label-ruler"></span>
+        </div>
+        <div id="syncScroll">
+          <div id="syncLaneStack">
+            <div id="syncImageTrack" class="sync-track"></div>
+            <div id="syncAudioTrack" class="sync-track">
+              <div id="syncAudioBlock" class="sync-audio-block"></div>
+            </div>
+            <div id="syncRuler" class="sync-ruler"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Controls below the timeline, one icon + name each: add image,
+         add audio, add prompt, generate beats. (Build video moved into
+         the always-visible Export button in the top-right corner.) -->
+    <div id="syncActions">
+      <button id="syncAddImages" class="sync-media-btn" title="Add images" aria-label="Add images">
+        <span class="sync-btn-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="3" />
+            <circle cx="9" cy="9" r="1.6" />
+            <path d="m21 15-4.5-4.5L6 21" />
+          </svg>
+        </span>
+        <span class="sync-btn-label">Add image</span>
+      </button>
+      <button id="syncAddVoice" class="sync-media-btn" title="Add voiceover" aria-label="Add voiceover">
+        <span class="sync-btn-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="2" width="6" height="12" rx="3" />
+            <path d="M5 10a7 7 0 0 0 14 0" />
+            <path d="M12 17v4" />
+          </svg>
+        </span>
+        <span class="sync-btn-label">Add audio</span>
+      </button>
+      <button id="syncAddPrompt" class="sync-media-btn" title="Add script" aria-label="Add script">
+        <span class="sync-btn-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="5" y="3.5" width="14" height="17" rx="2" />
+            <path d="M8.5 8.5h7M8.5 12h7M8.5 15.5h4.5" />
+          </svg>
+        </span>
+        <span class="sync-btn-label">Add script</span>
+      </button>
+      <button id="syncGenBeats" class="sync-media-btn" title="Generate beats from audio" aria-label="Generate beats from audio">
+        <span class="sync-btn-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 10v4M8 6v12M12 3v18M16 7v10M20 10v4" />
+          </svg>
+        </span>
+        <span class="sync-btn-label">Generate beats</span>
+      </button>
+    </div>
+
+    <!-- Advisory note: the duplicate-picture case - the same image
+         uploaded twice cannot cut to itself. -->
+    <p id="syncNote" class="sync-note" style="display: none"></p>
+
+
+    <audio id="syncAudio" preload="auto"></audio>
+    <!-- Voiceover picker: lives on the audio track when the job has no audio -->
+    <input
+      type="file"
+      id="syncAudioInput"
+      accept="audio/*"
+      style="display: none"
+    />
+
+    <!-- Status/errors: popup with a Cancel button (the old pill is gone). -->
+    <div id="syncMsg" class="sync-dialog" role="alertdialog" aria-modal="true" style="display: none">
+      <p id="syncMsgText" class="sync-dialog-text"></p>
+      <button id="syncMsgCancel" class="sync-dialog-cancel" type="button">Cancel</button>
+    </div>
+
+    <!-- Export: always visible at the top-right corner. Tapping it
+         renders the timeline into a video and downloads the finished
+         MP4 automatically (see sync.js). -->
+    <a id="downloadBtn" class="sync-download-btn" download
+       title="Render the timeline and download the video">
+      Export
+    </a>
+
+    <!-- Add prompt: paste a timestamped script (one line per visual
+         beat); sync.js parses it live and Apply retimes the timeline
+         (and the voiceover segments) to the script. -->
+    <div id="promptModal" class="prompt-modal" role="dialog" aria-modal="true" aria-label="Add prompt" style="display: none">
+      <div class="prompt-card">
+        <h2>Add prompt</h2>
+        <p class="prompt-hint">Paste your script with timestamps, one line per visual beat:</p>
+        <textarea id="promptText" class="prompt-textarea" rows="8" maxlength="10000"
+          placeholder="0:00 - Internet suddenly stops&#10;0:05 - Websites stop loading"></textarea>
+        <!-- Parse/validation errors, filled live by sync.js. -->
+        <p id="promptError" class="prompt-error" style="display: none" aria-live="polite"></p>
+        <div class="prompt-actions">
+          <button id="promptCancel" class="prompt-cancel" type="button">Cancel</button>
+          <button id="promptApply" class="prompt-apply" type="button" disabled>Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Apply progress: staged popup shown after Apply is pressed
+         (loading -> prompt received -> detected X timestamps ->
+         loading X images -> saved). The Cancel button inside aborts
+         the run at ANY stage - before the timeline is touched it just
+         closes; during the save it aborts the request and rolls the
+         timeline back to its pre-Apply state. Replaces the old result
+         line at the bottom of the page. -->
+    <div id="promptProgress" class="prompt-progress" role="dialog" aria-modal="true" aria-label="Applying prompt" style="display: none">
+      <div class="prompt-progress-card">
+        <div id="promptProgressSpinner" class="prompt-progress-spinner" aria-hidden="true"></div>
+        <p id="promptProgressText" class="prompt-progress-text" aria-live="polite">Loading…</p>
+        <button id="promptProgressCancel" class="prompt-cancel" type="button">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Generate beats from audio: opens the existing beat plan for
+         this voiceover as ONE copyable prompt (m:ss - beat), with a
+         clipboard icon so the whole prompt can be copied in a tap. -->
+    <div id="beatsModal" class="prompt-modal" role="dialog" aria-modal="true" aria-label="Beats from your audio" style="display: none">
+      <div class="prompt-card">
+        <h2>Beats from your audio</h2>
+        <p class="prompt-hint">Your whole beat prompt, ready to copy — paste it into Add prompt or any image tool:</p>
+        <textarea id="beatsPromptText" class="prompt-textarea" rows="8" maxlength="10000" readonly spellcheck="false"
+          placeholder="Generating beats…"></textarea>
+        <!-- Shown when the job has no plan yet (no voiceover, or the
+             transcription is still running). -->
+        <p id="beatsError" class="prompt-error" style="display: none" aria-live="polite"></p>
+        <div class="prompt-actions">
+          <button id="beatsClose" class="prompt-cancel" type="button">Close</button>
+          <button id="beatsCopyBtn" class="prompt-copy" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="8" y="2" width="8" height="4" rx="1" />
+              <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+            </svg>
+            <span id="beatsCopyLabel">Copy</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Generate beats: transcribing status popup. Shown when Generate
+         beats is tapped while Whisper is still running: live status
+         while it works, auto-closed on completion so the beats popup
+         above takes over. Reuses the Apply progress styling. -->
+    <div id="beatsProgress" class="prompt-progress" role="dialog" aria-modal="true" aria-label="Transcribing voiceover" style="display: none">
+      <div class="prompt-progress-card">
+        <div class="prompt-progress-spinner" aria-hidden="true"></div>
+        <p id="beatsProgressText" class="prompt-progress-text" aria-live="polite">Transcribing voiceover…</p>
+        <button id="beatsProgressCancel" class="prompt-cancel" type="button">Cancel</button>
+      </div>
+    </div>
+
+    <script src="{{ static_v('image-shrink.js') }}"></script>
+    <script src="{{ static_v('sync.js') }}"></script>
+    <script src="{{ static_v('firebase-config.js') }}"></script>
+    <script type="module" src="{{ static_v('auth.js') }}"></script>
+  </body>
+</html>

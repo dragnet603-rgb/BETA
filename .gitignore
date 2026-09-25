@@ -20,3 +20,12 @@ stats.db
 
 # Persistent Flask session secret
 .secret_key
+
+# Local sync debug / verification artifacts - never commit
+manifest_backup.json
+prompts_payload.json
+srv_err.txt
+srv_out.txt
+tests_out.txt
+verify_cuts.py
+verify_render.py
