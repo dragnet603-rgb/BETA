@@ -35,21 +35,30 @@ UPLOAD_FOLDER = Path("static/uploads")
 
 
 # ---------------------------------------------------------------
-# Transcription (local faster-whisper, OpenAI API as fallback)
+# Transcription engines, tried in order (STT_ENGINE pins a single one)
 #
-# Primary engine: faster-whisper (CTranslate2 port of Whisper) runs
-# fully offline on this machine — no API key, no per-minute cost.
+#   1. groq    whisper-large-v3(-turbo) on Groq's FREE tier
+#              (GROQ_API_KEY; ~8h of audio/day free, resets daily).
+#              OpenAI-compatible API: no model download, no CPU burn -
+#              the fast path on small/cheap hosts.
+#   2. local   faster-whisper (CTranslate2 port of Whisper) runs
+#              fully offline on this machine — no API key, no per-minute cost.
 #   WHISPER_MODEL        tiny|tiny.en|base|small|medium|large-v3 (default: tiny)
 #   WHISPER_DEVICE       auto|cpu|cuda                    (default: auto)
 #   WHISPER_COMPUTE_TYPE auto|int8|float16|float32        (default: auto -> int8 on CPU, float16 on CUDA)
 #   WHISPER_CPU_THREADS  int, 0 = auto (default: 0 -> os.cpu_count())
 #   WHISPER_NUM_WORKERS  int                              (default: 1)
-# Model weights download once on first use, then come from cache.
+#              Weights download once on first use, then come from cache.
+#              STT_LOCAL=0 skips this engine entirely (saves RAM and the
+#              download on 512MB hosts).
+#   3. openai  whisper-1 (needs OPENAI_API_KEY or WHISPER_API_KEY).
+#              The OpenRouter key used for chat does NOT cover audio
+#              transcription.
 #
-# Fallback: the OpenAI whisper-1 API (needs OPENAI_API_KEY or
-# WHISPER_API_KEY) is used only when the local engine is missing
-# or fails to load. The OpenRouter key used for chat does NOT
-# cover audio transcription.
+# The browser may transcribe FIRST (WebGPU, static/client-transcribe.js)
+# and skip this chain entirely. Any engine failure (missing key, 429 /
+# quota, network) falls through to the next one, so a free-tier hiccup
+# never fails a job.
 # ---------------------------------------------------------------
 
 _transcribe_client = None
@@ -72,6 +81,32 @@ def _get_transcribe_client():
 
             _transcribe_client = OpenAI(api_key=api_key)
         return _transcribe_client
+
+
+# Groq speaks the OpenAI API, so the same client class works with a
+# different base_url. Free tier: whisper-large-v3(-turbo), ~8h of audio
+# per day, resets daily.
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_DEFAULT_MODEL = "whisper-large-v3-turbo"
+
+_groq_client = None
+_groq_client_lock = threading.Lock()
+
+
+def _get_groq_client():
+    """Lazily-built Groq client, or None when GROQ_API_KEY is unset."""
+    global _groq_client
+    if not os.getenv("GROQ_API_KEY", "").strip():
+        return None
+    with _groq_client_lock:
+        if _groq_client is None:
+            from openai import OpenAI
+
+            _groq_client = OpenAI(
+                api_key=os.getenv("GROQ_API_KEY", "").strip(),
+                base_url=GROQ_BASE_URL,
+            )
+        return _groq_client
 
 
 def _get_whisper_model():
@@ -177,54 +212,176 @@ def _transcribe_local(audio_path: Path):
     return segments, words
 
 
+def _parse_api_transcription(result):
+    """OpenAI-shaped verbose_json response -> (segments, words).
+
+    Shared by the OpenAI and Groq paths: both return {"text",
+    "segments": [{start, end, text}], "words": [{start, end, word}]}.
+    Word entries are optional - when an engine omits them the caller
+    approximates timings from the segment text (words_from_segments).
+    """
+    segments = []
+    for seg in getattr(result, "segments", None) or []:
+        is_dict = isinstance(seg, dict)
+        text = (seg.get("text") if is_dict else getattr(seg, "text", None)) or ""
+        text = str(text).strip()
+        if not text:
+            continue
+        try:
+            start = float(seg.get("start") if is_dict else seg.start)
+            end = float(seg.get("end") if is_dict else seg.end)
+        except (TypeError, ValueError, AttributeError, KeyError):
+            continue
+        segments.append({
+            "start": round(start, 3), "end": round(end, 3), "text": text,
+        })
+
+    words = []
+    for w in getattr(result, "words", None) or []:
+        is_dict = isinstance(w, dict)
+        start = w.get("start") if is_dict else getattr(w, "start", None)
+        end = w.get("end") if is_dict else getattr(w, "end", None)
+        if start is None or end is None:
+            continue
+        try:
+            words.append({"start": float(start), "end": float(end)})
+        except (TypeError, ValueError):
+            continue
+    return segments, words
+
+
 def _transcribe_api(audio_path: Path):
     """OpenAI whisper-1 API -> ({start, end, text} segments, {start, end} words)."""
     client = _get_transcribe_client()
     with open(audio_path, "rb") as fh:
         result = client.audio.transcriptions.create(
-            model="whisper-1",
+            model=os.getenv("OPENAI_STT_MODEL", "whisper-1"),
             file=fh,
             response_format="verbose_json",
             # Ask for word-level timestamps too; the API only honours this
             # for verbose_json responses.
             timestamp_granularities=["word", "segment"],
         )
-    segments = []
-    for seg in getattr(result, "segments", None) or []:
-        text = (seg.get("text") or "").strip() if isinstance(seg, dict) else (seg.text or "").strip()
-        if not text:
-            continue
-        start = float(seg.get("start", seg.start) if isinstance(seg, dict) else seg.start)
-        end = float(seg.get("end", seg.end) if isinstance(seg, dict) else seg.end)
-        segments.append({"start": round(start, 3), "end": round(end, 3), "text": text})
-
-    words = []
-    for w in getattr(result, "words", None) or []:
-        start = w.get("start") if isinstance(w, dict) else getattr(w, "start", None)
-        end = w.get("end") if isinstance(w, dict) else getattr(w, "end", None)
-        if start is None or end is None:
-            continue
-        words.append({"start": float(start), "end": float(end)})
+    segments, words = _parse_api_transcription(result)
+    if segments and not words:
+        words = words_from_segments(segments)
     return segments, words
+
+
+def _is_granularity_error(exc):
+    """True when an engine rejected timestamp_granularities.
+
+    Word-level granularity is a per-engine feature; when one refuses it
+    we retry with segments only and approximate word timings locally
+    instead of failing the job.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "granularit" in text
+
+
+def _transcribe_groq(audio_path: Path):
+    """Groq whisper (free tier) -> ({start, end, text}, {start, end} words)."""
+    client = _get_groq_client()
+    if client is None:
+        raise RuntimeError("GROQ_API_KEY is not set.")
+    model = os.getenv("GROQ_STT_MODEL", GROQ_DEFAULT_MODEL)
+    result = None
+    for granularities in (["word", "segment"], ["segment"]):
+        with open(audio_path, "rb") as fh:
+            try:
+                result = client.audio.transcriptions.create(
+                    model=model,
+                    file=fh,
+                    response_format="verbose_json",
+                    timestamp_granularities=granularities,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - retried without words
+                if granularities == ["segment"] or not _is_granularity_error(exc):
+                    raise
+    segments, words = _parse_api_transcription(result)
+    if not segments:
+        raise RuntimeError("Groq returned no usable transcript segments.")
+    if not words:
+        # Engine omitted word timings: approximate from the segment text,
+        # which is all the segmentation engine needs (same trick the
+        # on-device WebGPU path uses).
+        words = words_from_segments(segments)
+    return segments, words
+
+
+def _local_enabled():
+    """STT_LOCAL=0 skips faster-whisper (saves RAM + the weights download)."""
+    return os.getenv("STT_LOCAL", "1").strip().lower() not in (
+        "0", "false", "off", "no",
+    )
+
+
+def _engine_order():
+    """Engines to try: STT_ENGINE pins one, otherwise Groq first."""
+    pinned = os.getenv("STT_ENGINE", "auto").strip().lower()
+    if pinned in ("", "auto"):
+        order = ["groq", "local", "openai"]
+    elif pinned in ("groq", "local", "openai"):
+        order = [pinned]
+    else:
+        raise RuntimeError(
+            f"Unknown STT_ENGINE={pinned!r} (use auto, groq, local or openai)."
+        )
+    if "local" in order and not _local_enabled():
+        order.remove("local")
+    return order
+
+
+def transcribe_with_engine(audio_path: Path):
+    """Voiceover -> (engine, segments, words), trying engines in order.
+
+    The engine name is returned so the job manifest can record which
+    one served the transcript. Engines that are not configured are
+    skipped; an engine that fails falls through to the next, so a
+    free-tier hiccup never fails a job.
+    """
+    errors = []
+    silent = None       # valid run, no speech detected (last resort)
+    for name in _engine_order():
+        if name == "groq" and _get_groq_client() is None:
+            continue
+        if name == "openai" and not (
+            os.getenv("OPENAI_API_KEY") or os.getenv("WHISPER_API_KEY")
+        ):
+            continue
+        try:
+            if name == "groq":
+                segments, words = _transcribe_groq(audio_path)
+            elif name == "local":
+                segments, words = _transcribe_local(audio_path)
+            else:
+                segments, words = _transcribe_api(audio_path)
+            if segments:
+                return name, segments, words
+            if silent is None:
+                silent = (name, segments, words)
+        except Exception as exc:  # noqa: BLE001 - try the next engine
+            errors.append(f"{name}: {exc}")
+    if silent is not None:
+        return silent
+    detail = "; ".join(errors) or "no transcription engine is configured"
+    raise RuntimeError(
+        f"Transcription failed ({detail}). Set GROQ_API_KEY for the free "
+        f"API, install faster-whisper locally, or set OPENAI_API_KEY."
+    )
 
 
 def transcribe(audio_path: Path):
     """
     Voiceover -> ({start, end, text} speech segments, {start, end} words).
 
-    Runs faster-whisper locally (free, offline). If the local engine is
-    not installed or fails, falls back to the OpenAI whisper-1 API when
-    an API key is available; otherwise the error is surfaced to the job.
+    Tries the configured engines in order (see the chain docs at the top
+    of this module); see transcribe_with_engine() for the engine-aware
+    variant used by the job worker.
     """
-    try:
-        return _transcribe_local(audio_path)
-    except ImportError:
-        # faster-whisper is not installed -> paid API fallback.
-        return _transcribe_api(audio_path)
-    except Exception as exc:  # noqa: BLE001 - model load / inference failure
-        if os.getenv("OPENAI_API_KEY") or os.getenv("WHISPER_API_KEY"):
-            return _transcribe_api(audio_path)
-        raise RuntimeError(f"Local transcription failed: {exc}") from exc
+    _engine, segments, words = transcribe_with_engine(audio_path)
+    return segments, words
 
 
 # ============================================================
@@ -682,7 +839,9 @@ def start_transcription_job(job_id: str):
         try:
             # Transcribe a normalized copy; the original stays as the
             # render's mux source.
-            segments, words = transcribe(_prepare_transcription_source(audio_file))
+            engine, segments, words = transcribe_with_engine(
+                _prepare_transcription_source(audio_file)
+            )
             m = load_manifest(job_id) or manifest
             image_count = len(m.get("images") or [])
             audio_duration = get_media_duration(audio_file)
@@ -710,13 +869,16 @@ def start_transcription_job(job_id: str):
             # The sync timeline above needs only timings; the sync engine
             # never reads this key.
             m["segments_with_text"] = segments
+            # Which engine produced this transcript (groq | local | openai)
+            # - shown on the admin page alongside the timing event.
+            m["transcript_engine"] = engine
             m["status"] = "ready"
             m["error"] = None
             save_manifest(job_id, m)
             _log_transcribe_event(
                 "transcribe_done",
                 f"{job_id} {audio_duration:.0f}s audio in "
-                f"{time.time() - started:.0f}s wall",
+                f"{time.time() - started:.0f}s wall via {engine}",
             )
         except Exception as exc:  # noqa: BLE001 - surfaced to the client
             # Log FIRST: if the job dir vanished (job deleted mid-run) the
