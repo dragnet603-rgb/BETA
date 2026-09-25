@@ -227,6 +227,114 @@ def transcribe(audio_path: Path):
         raise RuntimeError(f"Local transcription failed: {exc}") from exc
 
 
+# ============================================================
+# CLIENT-SIDE (WebGPU) TRANSCRIPTION  -  helpers
+#
+# The browser optionally runs Whisper itself (transformers.js + WebGPU,
+# see static/client-transcribe.js) and POSTs the segment chunks here.
+# These helpers validate/normalize that untrusted input so the server
+# can adopt it exactly like faster-whisper's output - the rest of the
+# pipeline (resolve_visual_segments, beat_planner) then works unchanged.
+# ============================================================
+
+CLIENT_TRANSCRIBE_MAX_SEGMENTS = 400
+CLIENT_TRANSCRIBE_MAX_TEXT = 400
+
+
+def client_transcribe_enabled() -> bool:
+    """SYNC_CLIENT_TRANSCRIBE env toggle: may the browser's transcript be
+    adopted instead of running server-side Whisper? Enabled by default;
+    set SYNC_CLIENT_TRANSCRIBE=0 to force every job through the server."""
+    return os.getenv("SYNC_CLIENT_TRANSCRIBE", "1").strip().lower() not in (
+        "0", "false", "off", "no",
+    )
+
+
+def clean_client_segments(raw_segments, audio_duration):
+    """Validate/normalize browser transcript chunks -> [{start, end, text}]
+    or None when nothing usable is left.
+
+    Client input is untrusted: drop non-dicts, non-finite/negative times,
+    empty text, out-of-order chunks and times past the audio's end; clamp
+    small overlaps from chunked Whisper output; cap count and text length.
+    """
+    if not isinstance(raw_segments, list) or not raw_segments:
+        return None
+    cleaned = []
+    prev_end = 0.0
+    for seg in raw_segments[:CLIENT_TRANSCRIBE_MAX_SEGMENTS]:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            start = float(seg.get("start"))
+            end = float(seg.get("end"))
+        except (TypeError, ValueError):
+            continue
+        text = str(seg.get("text") or "").strip()
+        if not (start >= 0 and end > start and text):
+            continue
+        if audio_duration and audio_duration > 0 and end > audio_duration + 1:
+            continue
+        # Chunked output can overlap by a few ms: clamp instead of drop.
+        start = max(start, prev_end)
+        if end <= start:
+            continue
+        cleaned.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": text[:CLIENT_TRANSCRIBE_MAX_TEXT],
+        })
+        prev_end = end
+    return cleaned or None
+
+
+def words_from_segments(segments):
+    """Approximate word timings from segment text: [{'start', 'end'}, ...].
+
+    faster-whisper emits real word timestamps, the client pass does not.
+    The segmentation engine only needs monotonic in-range word boundaries
+    (and tolerates an empty list), so split each segment's text on
+    whitespace and share its time proportionally to character count.
+    Word dicts mirror _transcribe_local's shape: {'start', 'end'}.
+    """
+    words = []
+    for seg in segments or []:
+        try:
+            start = float(seg.get("start"))
+            end = float(seg.get("end"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not (start >= 0 and end > start):
+            continue
+        tokens = str(seg.get("text") or "").split()
+        if not tokens:
+            continue
+        span = end - start
+        weights = [len(t) + 1 for t in tokens]
+        total = float(sum(weights))
+        cursor = start
+        for i, w in enumerate(weights):
+            w_end = end if i == len(weights) - 1 else start + span * (
+                sum(weights[:i + 1]) / total
+            )
+            if w_end > cursor:
+                words.append({
+                    "start": round(cursor, 3),
+                    "end": round(w_end, 3),
+                })
+            cursor = w_end
+    return words
+
+
+def file_sha256(path) -> str:
+    """SHA-256 hex of a stored file ("" when unreadable) - used to prove
+    an on-device transcript was produced from the exact uploaded bytes."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
 def get_media_duration(path: Path) -> float:
     """ffprobe duration in seconds (fallback: 0)."""
     try:

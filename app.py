@@ -1159,22 +1159,81 @@ def sync_audio(job_id):
     manifest["audio"] = audio_name
     manifest["audio_name"] = audio.filename
     manifest["status"] = "transcribing"
+
+    # Optional fast path: the browser only sends client_transcribe=1 after
+    # checking it can run Whisper on-device (WebGPU), and only when the
+    # server allows it (SYNC_CLIENT_TRANSCRIBE). In that case the
+    # server-side Whisper job is NOT started here - the client POSTs its
+    # transcript to /sync/client-transcript next. If that never happens
+    # (tab closed, client failure), the /sync/status watchdog starts the
+    # normal job after CLIENT_TRANSCRIBE_WATCHDOG_S seconds, and
+    # POST /sync/transcribe is the browser's own explicit fallback.
+    use_client = (
+        request.form.get("client_transcribe") == "1"
+        and sync_pipeline.client_transcribe_enabled()
+    )
+    if use_client:
+        manifest["client_transcribe"] = {
+            "state": "pending",
+            "started_at": time.time(),
+        }
     sync_pipeline.save_manifest(job_id, manifest)
-    sync_pipeline.start_transcription_job(job_id)
+    if not use_client:
+        sync_pipeline.start_transcription_job(job_id)
 
     _stats.log_event(
         session.get("email", ""), session.get("uid", ""),
         "sync_audio_added", audio_name,
     )
-    return jsonify({"status": "transcribing"})
+    return jsonify({"status": "transcribing", "client_transcribe": use_client})
 
 
-@app.get("/sync/status/<job_id>")
-def sync_status(job_id):
-    manifest = sync_pipeline.load_manifest(job_id)
-    if not manifest:
-        return jsonify({"error": "Unknown job."}), 404
+# On-device transcription watchdog: /sync/audio in client mode leaves the
+# status at "transcribing" WITHOUT starting server-side Whisper. If the
+# browser never delivers its transcript (tab closed, crash), the first
+# status poll after this grace period starts the normal server job. The
+# client's own hard timeout is 120s (static/client-transcribe.js), so an
+# honest on-device run always finishes or falls back before this fires.
+CLIENT_TRANSCRIBE_WATCHDOG_S = 150
+_CLIENT_TRANSCRIBE_LOCK = threading.Lock()
 
+
+def _watchdog_client_transcribe(job_id, manifest):
+    """Start server Whisper when an on-device run went silent. Returns the
+    (possibly refreshed) manifest."""
+    marker = manifest.get("client_transcribe") or {}
+    try:
+        age = time.time() - float(marker.get("started_at") or 0)
+    except (TypeError, ValueError):
+        age = 0.0
+    if (manifest.get("status") != "transcribing"
+            or marker.get("state") != "pending"
+            or age < CLIENT_TRANSCRIBE_WATCHDOG_S):
+        return manifest
+    with _CLIENT_TRANSCRIBE_LOCK:
+        fresh = sync_pipeline.load_manifest(job_id) or manifest
+        marker = fresh.get("client_transcribe") or {}
+        if (fresh.get("status") != "transcribing"
+                or marker.get("state") != "pending"):
+            return fresh
+        # Mark FIRST: even if the start below fails there is no retry
+        # loop - /sync/beats' lazy transcription remains the last resort.
+        fresh["client_transcribe"] = {
+            **marker, "state": "server_fallback", "fallback_at": time.time(),
+        }
+        sync_pipeline.save_manifest(job_id, fresh)
+        try:
+            sync_pipeline.start_transcription_job(job_id)
+        except Exception as exc:  # noqa: BLE001 - surfaced via status
+            fresh["status"] = "error"
+            fresh["error"] = str(exc)
+            sync_pipeline.save_manifest(job_id, fresh)
+        return sync_pipeline.load_manifest(job_id) or fresh
+
+
+def _sync_status_payload(job_id, manifest):
+    """Shared body of /sync/status - also returned by the client-transcript
+    adoption route so the page can apply it exactly like a status poll."""
     response = {
         "status": manifest.get("status", "unknown"),
         "matched": manifest.get("matched"),
@@ -1198,7 +1257,202 @@ def sync_status(job_id):
     response["has_audio"] = bool(audio_name)
     if audio_name:
         response["audio_url"] = f"/static/uploads/{job_id}/{audio_name}"
-    return jsonify(response)
+    return response
+
+
+@app.get("/sync/status/<job_id>")
+def sync_status(job_id):
+    manifest = sync_pipeline.load_manifest(job_id)
+    if not manifest:
+        return jsonify({"error": "Unknown job."}), 404
+    manifest = _watchdog_client_transcribe(job_id, manifest)
+    return jsonify(_sync_status_payload(job_id, manifest))
+
+
+# ============================================================
+# CLIENT TRANSCRIPT ADOPTION  (WebGPU on-device Whisper -> fast beats)
+#
+# Flow: /sync/audio received client_transcribe=1 and SKIPPED the
+# server-side Whisper job (client_transcribe marker = pending). The
+# browser then transcribed the voiceover itself
+# (static/client-transcribe.js, transformers.js + WebGPU) and POSTs the
+# segments here together with the SHA-256 of the exact audio bytes it
+# uploaded.
+#
+# The server stays authoritative:
+#   - SYNC_CLIENT_TRANSCRIBE=0 refuses adoption (client falls back);
+#   - the audio hash must match the stored file;
+#   - segments are validated/normalized via
+#     sync_pipeline.clean_client_segments (count/text/duration caps);
+#   - the SAME visual resolution + beat planner as the server path runs
+#     here, so beats/build_render_command consume it unchanged;
+#   - an existing server transcript always wins - adoption is only
+#     possible while the client marker is still "pending".
+#
+# If this route is never called (tab closed, client failure), the
+# /sync/status watchdog starts the normal server transcription after
+# CLIENT_TRANSCRIBE_WATCHDOG_S seconds; POST /sync/transcribe is the
+# browser's own explicit fallback.
+# ============================================================
+
+CLIENT_TRANSCRIPT_MAX_AUDIO_SECONDS = 600
+
+
+@app.post("/sync/client-transcript/<job_id>")
+def sync_client_transcript(job_id):
+    """Adopt an on-device transcript: resolve the visual timeline, plan
+    beats, flip the job to ready. Replies with the /sync/status payload
+    (plus source) so the page applies it exactly like a status poll."""
+    # Serialize against the status watchdog: whichever side gets here
+    # first decides whether this job is client- or server-transcribed.
+    with _CLIENT_TRANSCRIBE_LOCK:
+        manifest = sync_pipeline.load_manifest(job_id)
+        if not manifest:
+            return jsonify({"error": "Unknown job."}), 404
+
+        marker = manifest.get("client_transcribe") or {}
+        if (manifest.get("segments_with_text")
+                or manifest.get("status") != "transcribing"
+                or marker.get("state") != "pending"):
+            # The server path owns this job already (transcript done, or
+            # the fallback/watchdog took over): client polls /sync/status.
+            return jsonify({"error": "Server transcription owns this job.",
+                            "fallback": True}), 409
+        if not sync_pipeline.client_transcribe_enabled():
+            return jsonify({
+                "error": "On-device transcription is disabled on this server.",
+                "fallback": True,
+            }), 403
+
+        data = request.get_json(silent=True) or {}
+
+        audio_name = manifest.get("audio")
+        if not audio_name:
+            return jsonify({"error": "Add a voiceover first.",
+                            "fallback": True}), 409
+        audio_file = sync_pipeline.job_dir(job_id) / audio_name
+        if not audio_file.exists():
+            return jsonify({"error": "Voiceover file missing on server.",
+                            "fallback": True}), 410
+
+        # The client hashed the SAME bytes it uploaded - a mismatch means
+        # it transcribed a different file than the server stored.
+        client_hash = str(data.get("audio_sha256") or "").strip().lower()
+        if (not client_hash
+                or client_hash != sync_pipeline.file_sha256(audio_file)):
+            return jsonify({"error": "Audio hash mismatch.",
+                            "fallback": True}), 400
+
+        audio_duration = sync_pipeline.get_media_duration(audio_file)
+        if not audio_duration or audio_duration <= 0:
+            # ffprobe failed; the client decoded the file to transcribe
+            # it, so its measured duration is a usable fallback.
+            try:
+                audio_duration = float(data.get("duration"))
+            except (TypeError, ValueError):
+                audio_duration = 0
+        if not audio_duration or audio_duration <= 0:
+            return jsonify({"error": "Could not read voiceover duration.",
+                            "fallback": True}), 502
+        if audio_duration > CLIENT_TRANSCRIPT_MAX_AUDIO_SECONDS:
+            return jsonify({"error": "Voiceover too long for on-device preview.",
+                            "fallback": True}), 413
+
+        segments = sync_pipeline.clean_client_segments(
+            data.get("segments"), audio_duration
+        )
+        if not segments:
+            return jsonify({"error": "No usable transcript segments.",
+                            "fallback": True}), 400
+
+        # Word timings: faster-whisper emits real ones, the browser pass
+        # does not - approximate from the segment text (monotonic and
+        # in-range is all the segmentation engine needs).
+        words = sync_pipeline.words_from_segments(segments)
+        image_count = len(manifest.get("images") or [])
+        if image_count:
+            try:
+                (manifest["segments"],
+                 manifest["matched"],
+                 manifest["sync_warning"]
+                 ) = sync_pipeline.resolve_visual_segments(
+                    words, segments, image_count, audio_duration,
+                )
+            except Exception as exc:  # noqa: BLE001 - surfaced, non-fatal
+                return jsonify({"error": f"Could not sync the timeline: {exc}",
+                                "fallback": True}), 500
+            # Preview clips mirror the resolved timeline (same as the
+            # server worker), so manifest and page stay in lockstep.
+            manifest["clips"] = sync_pipeline.clips_from_segments(
+                manifest["segments"]
+            )
+        else:
+            # Audio-first job: no images yet. The add-images route
+            # resolves the same segments later from segments_with_text -
+            # exactly the server worker's audio-first branch.
+            manifest["segments"] = []
+            manifest["matched"] = False
+            manifest["sync_warning"] = None
+
+        manifest["words"] = words
+        manifest["segments_with_text"] = segments
+        manifest["status"] = "ready"
+        manifest["error"] = None
+
+        # Plan beats eagerly (pure Python, milliseconds) so Generate
+        # beats answers instantly - same plan + version /sync/beats
+        # would build from this transcript.
+        try:
+            manifest["beats"] = beat_planner.plan_beats(
+                (segments, words), audio_duration
+            )
+            manifest["beats_version"] = beat_planner.PLAN_VERSION
+        except Exception:  # noqa: BLE001 - advisory; /sync/beats retries
+            pass
+
+        marker = dict(marker)
+        marker.update({
+            "state": "adopted",
+            "engine": str(data.get("engine") or "client")[:64],
+            "segment_count": len(segments),
+            "adopted_at": time.time(),
+        })
+        manifest["client_transcribe"] = marker
+        sync_pipeline.save_manifest(job_id, manifest)
+
+    payload = _sync_status_payload(job_id, manifest)
+    payload["source"] = "client"
+    _stats.log_event(
+        session.get("email", ""), session.get("uid", ""),
+        "sync_client_transcript", f"{marker['engine']}:{len(segments)} segs",
+    )
+    return jsonify(payload)
+
+
+@app.post("/sync/transcribe/<job_id>")
+def sync_transcribe_fallback(job_id):
+    """The browser's explicit fallback: (re)start the normal server-side
+    Whisper job after on-device transcription failed or was refused.
+    Idempotent - a job already running (or finished) is left alone."""
+    with _CLIENT_TRANSCRIBE_LOCK:
+        manifest = sync_pipeline.load_manifest(job_id)
+        if not manifest:
+            return jsonify({"error": "Unknown job."}), 404
+        if not manifest.get("audio"):
+            return jsonify({"error": "Add a voiceover first."}), 409
+        if manifest.get("segments_with_text") or manifest.get("status") in (
+                "ready", "processing"):
+            return jsonify({"status": manifest.get("status")})
+        marker = dict(manifest.get("client_transcribe") or {})
+        marker["state"] = "server_fallback"
+        marker["fallback_at"] = time.time()
+        manifest["client_transcribe"] = marker
+        sync_pipeline.save_manifest(job_id, manifest)
+        try:
+            sync_pipeline.start_transcription_job(job_id)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the client
+            return jsonify({"error": str(exc)}), 500
+    return jsonify({"status": "transcribing"})
 
 
 @app.post("/sync/update/<job_id>")

@@ -1306,14 +1306,93 @@
     try {
       const fd = new FormData();
       fd.append("audio", file);
+      // Fast path: only a browser that can run Whisper on-device asks the
+      // server to hold off its own run. The server can still refuse
+      // (SYNC_CLIENT_TRANSCRIBE=0) - its reply decides which path runs.
+      if (window.AQClientTranscribe && await window.AQClientTranscribe.isSupported()) {
+        fd.append("client_transcribe", "1");
+      }
       const res = await fetch(`/sync/audio/${JOB_ID}`, { method: "POST", body: fd });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Audio upload failed");
+      if (data.client_transcribe) {
+        await transcribeOnDevice(file);
+        return;
+      }
       showMsg("Voiceover uploaded - transcribing…");
       boot();
     } catch (err) {
       showMsg(err.message, true);
       paintVoiceoverChip(false);
+    }
+  }
+
+  /** SHA-256 hex of the exact bytes we uploaded: the server compares it
+   *  against the stored file before adopting an on-device transcript. */
+  async function sha256Hex(file) {
+    const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  /**
+   * On-device Whisper run (WebGPU, static/client-transcribe.js): decode
+   * + transcribe locally, then POST the segments for adoption. The server
+   * validates the audio hash and runs the SAME visual resolution + beat
+   * planner as the server path, and replies with a /sync/status payload
+   * that applyServerData consumes like any status poll.
+   *
+   * ANY failure (model unsupported, timeout, server refusal, hash
+   * mismatch) falls back to the normal server-side job via
+   * POST /sync/transcribe + boot() - the timeline never gets stuck.
+   */
+  async function transcribeOnDevice(file) {
+    const setChip = (text) => {
+      if (audioBlock) {
+        audioBlock.innerHTML = `<span class="chipTitle">${escapeHtml(text)}</span>`;
+      }
+    };
+    const PHASE = {
+      "loading-model": "Loading Whisper on your device…",
+      "transcribing": "Transcribing on your device…",
+    };
+    try {
+      setChip("Transcribing on your device…");
+      const result = await window.AQClientTranscribe.transcribe(file, {
+        onProgress: (phase) => setChip(PHASE[phase] || "Transcribing on your device…"),
+      });
+      const res = await fetch(`/sync/client-transcript/${JOB_ID}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          segments: result.segments,
+          duration: result.duration,
+          engine: result.engine,
+          audio_sha256: await sha256Hex(file),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Transcript rejected (${res.status})`);
+      applyServerData(data);
+      if (!dragActive) render();
+      paintVoiceoverChip(true);
+      window.posthog?.capture("sync_client_transcribe_adopted", {
+        engine: result.engine,
+        segment_count: result.segments.length,
+        duration: Math.round(result.duration),
+      });
+      return true;
+    } catch (err) {
+      console.warn("On-device transcription failed, falling back to server:", err);
+      window.posthog?.capture("sync_client_transcribe_fallback", {
+        error: String((err && err.message) || err),
+      });
+      setChip("Falling back to server transcription…");
+      try {
+        await fetch(`/sync/transcribe/${JOB_ID}`, { method: "POST" });
+      } catch (e) { /* boot() below surfaces the server status anyway */ }
+      await boot();
+      return false;
     }
   }
 
