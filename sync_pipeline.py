@@ -39,9 +39,11 @@ UPLOAD_FOLDER = Path("static/uploads")
 #
 # Primary engine: faster-whisper (CTranslate2 port of Whisper) runs
 # fully offline on this machine — no API key, no per-minute cost.
-#   WHISPER_MODEL        tiny|base|small|medium|large-v3  (default: base)
+#   WHISPER_MODEL        tiny|tiny.en|base|small|medium|large-v3 (default: tiny)
 #   WHISPER_DEVICE       auto|cpu|cuda                    (default: auto)
-#   WHISPER_COMPUTE_TYPE auto|int8|float16|float32        (default: auto)
+#   WHISPER_COMPUTE_TYPE auto|int8|float16|float32        (default: auto -> int8 on CPU, float16 on CUDA)
+#   WHISPER_CPU_THREADS  int, 0 = auto (default: 0 -> os.cpu_count())
+#   WHISPER_NUM_WORKERS  int                              (default: 1)
 # Model weights download once on first use, then come from cache.
 #
 # Fallback: the OpenAI whisper-1 API (needs OPENAI_API_KEY or
@@ -79,20 +81,44 @@ def _get_whisper_model():
         if _whisper_model is None:
             from faster_whisper import WhisperModel
 
-            model_name = os.getenv("WHISPER_MODEL", "base")
+            # tiny is ~3-5x faster than base on CPU; sync only needs word
+            # TIMINGS for beat cuts, so the rougher tiny transcript is fine.
+            # Override per deployment with WHISPER_MODEL=base|small|... .
+            model_name = os.getenv("WHISPER_MODEL", "tiny")
             device = os.getenv("WHISPER_DEVICE", "auto")
             compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
-            try:
-                _whisper_model = WhisperModel(
-                    model_name, device=device, compute_type=compute_type
+
+            def _int_env(name, default):
+                try:
+                    return max(0, int(os.getenv(name, str(default))))
+                except (TypeError, ValueError):
+                    return default
+
+            # 0 = auto -> all available cores; faster-whisper's built-in
+            # default (4) underuses larger boxes.
+            cpu_threads = _int_env("WHISPER_CPU_THREADS", 0) or (os.cpu_count() or 4)
+            num_workers = _int_env("WHISPER_NUM_WORKERS", 1) or 1
+
+            def _build(device, compute_type):
+                # "auto" compute lets CTranslate2 pick float32 on CPU, which
+                # is slower and heavier than int8 with no timing benefit.
+                if compute_type in ("", "auto"):
+                    compute_type = "float16" if device == "cuda" else "int8"
+                return WhisperModel(
+                    model_name,
+                    device=device,
+                    compute_type=compute_type,
+                    cpu_threads=cpu_threads,
+                    num_workers=num_workers,
                 )
+
+            try:
+                _whisper_model = _build(device, compute_type)
             except Exception:
                 if device == "cpu" and compute_type in ("", "auto", "int8"):
                     raise
                 # e.g. CUDA requested but unavailable -> fall back to CPU.
-                _whisper_model = WhisperModel(
-                    model_name, device="cpu", compute_type="int8"
-                )
+                _whisper_model = _build("cpu", "int8")
         return _whisper_model
 
 
