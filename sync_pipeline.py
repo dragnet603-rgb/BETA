@@ -1035,6 +1035,64 @@ def _shrink_for_render(folder: Path, image_name: str) -> Path:
 
 
 
+THUMB_LONG_EDGE = 480
+THUMB_QUALITY = 78
+
+
+def make_thumbnail(folder: Path, image_name: str):
+    """Create/return "<stem>_t.jpg" for an image, or None when useless.
+
+    The sync timeline paints every uploaded picture as a small filmstrip
+    tile, so it needs a tiny copy - not the 1920px original (a 20-image
+    job was pulling ~10MB per page load just to draw thumbnails, through
+    a CDN that could not cache them). Generated once at upload time
+    (~20-40ms) and reused on every later load. Never raises: a missing
+    thumbnail simply means the client keeps using the full image.
+    """
+    src = folder / image_name
+    if not src.exists():
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    name = f"{src.stem}_t.jpg"
+    out = src.with_name(name)
+    if out.exists():
+        return name
+    try:
+        with Image.open(src) as im:
+            width, height = im.size
+            long_edge = max(width, height)
+            if long_edge <= THUMB_LONG_EDGE:
+                return None       # already tiny - serve the original
+            scale = THUMB_LONG_EDGE / long_edge
+            thumb = im.convert("RGB").resize(
+                (max(1, round(width * scale)), max(1, round(height * scale))),
+                Image.LANCZOS,
+            )
+        thumb.save(out, "JPEG", quality=THUMB_QUALITY)
+        thumb.close()
+    except Exception:  # noqa: BLE001 - a thumbnail is never load-bearing
+        return None
+    return name
+
+
+def thumbnail_names(folder: Path, names):
+    """[thumbnail filename or None, per image] for the sync payloads.
+
+    Index-aligned with the image list so the client can pick a tile URL
+    per image. Jobs uploaded before thumbnails existed simply get None
+    everywhere and keep using the full images - no migration needed.
+    """
+    out = []
+    for name in names or []:
+        thumb = f"{Path(name).stem}_t.jpg"
+        out.append(thumb if (folder / thumb).exists() else None)
+    return out
+
+
 def _render_fps():
     """Still-input frame rate for the render concat (SYNC_RENDER_FPS).
 

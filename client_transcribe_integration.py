@@ -8,6 +8,8 @@ Assumes a local server is running (python app.py) and exercises:
 
 import hashlib
 import json
+import shutil
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -35,16 +37,25 @@ def http(path, data=None, headers=None, method=None):
             return e.code, {"raw": body}
 
 
-def multipart(fields, file_field, filename, content):
+def multipart(fields, file_field, filename, content, extra=None,
+             content_type="audio/mpeg"):
+    """Build a multipart/form-data body.
+
+    `extra` is a list of (filename, content, content_type) tuples added
+    under the same field name, for multi-file posts.
+    """
     boundary = "----aqboundary7f3a"
     body = b""
     for k, v in fields.items():
         body += (f"--{boundary}\r\nContent-Disposition: form-data; "
                  f'name="{k}"\r\n\r\n{v}\r\n').encode()
-    body += (f"--{boundary}\r\nContent-Disposition: form-data; "
-             f'name="{file_field}"; filename="{filename}"\r\n'
-             f"Content-Type: audio/mpeg\r\n\r\n").encode()
-    body += content + f"\r\n--{boundary}--\r\n".encode()
+    parts = [(filename, content, content_type)] + list(extra or [])
+    for fn, content_bytes, ct in parts:
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; "
+                 f'name="{file_field}"; filename="{fn}"\r\n'
+                 f"Content-Type: {ct}\r\n\r\n").encode()
+        body += content_bytes + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
     return body, {"Content-Type": f"multipart/form-data; boundary={boundary}"}
 
 
@@ -53,7 +64,7 @@ def make_job(status, images=()):
     d = UP / job
     d.mkdir(parents=True, exist_ok=True)
     for i, name in enumerate(images):
-        Image.new("RGB", (8, 8), (10 * i + 5, 30, 60)).save(d / name)
+        Image.new("RGB", (800, 600), (10 * i + 5, 30, 60)).save(d / name)
     manifest = {
         "images": list(images), "audio": None, "audio_name": None,
         "status": status, "matched": None, "error": None,
@@ -108,6 +119,11 @@ assert code == 200, (code, resp)
 assert resp["status"] == "ready" and resp["source"] == "client", resp
 assert resp["matched"] is True and len(resp["segments"]) == 2, resp
 assert resp["has_audio"] and resp["image_count"] == 2, resp
+# Thumbnails ride along with every image list, index-aligned. These two
+# images were injected straight into the job folder (the real upload
+# path is exercised in 2b), so the entries are legitimately null here.
+thumbs = resp.get("image_thumbs")
+assert isinstance(thumbs, list) and len(thumbs) == 2, resp
 m = read_manifest(job)
 assert m["status"] == "ready"
 assert m["segments_with_text"][0]["text"].startswith("Welcome")
@@ -117,6 +133,39 @@ assert len(m["clips"]) == 2 and len(m["words"]) >= 6
 print(f"2. adoption OK: matched={resp['matched']}, "
       f"beats={len(m['beats'].get('beats', []))}, "
       f"suggested={m['beats'].get('image_count')}")
+
+# ── 2b. the real /sync/upload path generates filmstrip thumbnails ─────
+img_tmp = tempfile.TemporaryDirectory()
+try:
+    p1 = Path(img_tmp.name) / "one.png"
+    p2 = Path(img_tmp.name) / "two.png"
+    Image.new("RGB", (1200, 900), (200, 40, 40)).save(p1)
+    Image.new("RGB", (1000, 1400), (40, 200, 40)).save(p2)
+    body, hdr = multipart(
+        {}, "images", "one.png", p1.read_bytes(),
+        extra=[("two.png", p2.read_bytes(), "image/png")],
+        content_type="image/png",
+    )
+    code, up = http("/sync/upload", data=body, headers=hdr)
+    assert code == 200, (code, up)
+    assert up.get("image_count") == 2, up
+    up_thumbs = up.get("image_thumbs") or []
+    assert len(up_thumbs) == 2 and all(up_thumbs), up
+    img_job = up["job_id"]
+    for rel in up_thumbs:
+        path = UP / img_job / rel.split("/")[-1]
+        assert path.exists(), f"missing {rel}"
+        # A 480px JPEG is tens of KB; the original PNGs are far bigger.
+        assert path.stat().st_size < 150_000, f"thumbnail too big: {path}"
+    # ...and they are served on every later status poll too.
+    code, st = http(f"/sync/status/{img_job}")
+    st_thumbs = st.get("image_thumbs") or []
+    assert len(st_thumbs) == 2 and all(st_thumbs), st
+    print("2b. /sync/upload generates filmstrip thumbnails (payload + files) OK")
+finally:
+    img_tmp.cleanup()
+    if "img_job" in dir():
+        shutil.rmtree(UP / img_job, ignore_errors=True)
 
 # ── 3. beats + status endpoints serve the adopted transcript ───────────
 code, resp = http(f"/sync/beats/{job}")

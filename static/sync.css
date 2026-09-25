@@ -708,6 +708,21 @@ body,
   -webkit-tap-highlight-color: transparent;
 }
 
+/* Optimistic tile: painted from a local preview while the upload is still
+   running. Dimmed + gently pulsing so it reads as "not here yet"; the real
+   block replaces it the moment the response lands. */
+.sync-img-block.pending {
+  opacity: 0.75;
+  animation: aqPendingPulse 1.2s ease-in-out infinite;
+}
+@keyframes aqPendingPulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 0.9; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sync-img-block.pending { animation: none; opacity: 0.8; }
+}
+
 /* Index number, top-left */
 .sync-img-block .blockNum {
   position: absolute;

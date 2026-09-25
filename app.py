@@ -1008,6 +1008,15 @@ def sync_upload():
         shutil.rmtree(folder, ignore_errors=True)
         return jsonify({"error": f"Could not store upload: {exc}"}), 500
 
+    # Tiny filmstrip copies so the sync timeline paints thumbnails
+    # instead of the full-size images (sync_pipeline.make_thumbnail).
+    # Best effort: a thumbnail must never be able to fail an upload.
+    for name in saved:
+        try:
+            sync_pipeline.make_thumbnail(folder, name)
+        except Exception:  # noqa: BLE001
+            pass
+
     has_audio = bool(audio_name)
     # The same picture uploaded twice cannot cut to itself, so the video
     # silently holds that image across those beats and looks out of sync.
@@ -1036,7 +1045,11 @@ def sync_upload():
     return jsonify({"status": "complete", "job_id": job_id,
                     "image_count": len(saved),
                     "awaiting_audio": not has_audio,
-                    "image_warning": image_warning})
+                    "image_warning": image_warning,
+                    "image_thumbs": [
+                        (f"/static/uploads/{job_id}/{t}" if t else None)
+                        for t in sync_pipeline.thumbnail_names(folder, saved)
+                    ]})
 
 
 @app.post("/sync/images/<job_id>")
@@ -1082,6 +1095,13 @@ def sync_add_images(job_id):
         for name in saved:
             (folder / name).unlink(missing_ok=True)
         return jsonify({"error": f"Could not store upload: {exc}"}), 500
+
+    # Same tiny filmstrip copies as the initial upload.
+    for name in saved:
+        try:
+            sync_pipeline.make_thumbnail(folder, name)
+        except Exception:  # noqa: BLE001
+            pass
 
     manifest["images"] = existing + saved
     # Fresh duplicates can appear when the same picture is uploaded again
@@ -1129,6 +1149,10 @@ def sync_add_images(job_id):
         "added": len(saved),
         "images": manifest["images"],
         "image_urls": [f"/static/uploads/{job_id}/{n}" for n in saved],
+        "image_thumbs": [
+            (f"/static/uploads/{job_id}/{t}" if t else None)
+            for t in sync_pipeline.thumbnail_names(folder, saved)
+        ],
         "segments": manifest.get("segments") or [],
         "matched": manifest.get("matched"),
         "warning": manifest.get("sync_warning"),
@@ -1257,6 +1281,14 @@ def _sync_status_payload(job_id, manifest):
         "image_urls": [
             f"/static/uploads/{job_id}/{name}"
             for name in manifest.get("images", [])
+        ],
+        # Index-aligned with image_urls: the filmstrip paints these tiny
+        # copies (null = none stored, the client uses the full image).
+        "image_thumbs": [
+            (f"/static/uploads/{job_id}/{t}" if t else None)
+            for t in sync_pipeline.thumbnail_names(
+                sync_pipeline.job_dir(job_id), manifest.get("images", [])
+            )
         ],
     }
     audio_name = manifest.get("audio")

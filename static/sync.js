@@ -105,6 +105,7 @@
     sig: "",       // fingerprint, so status polls don't clobber edits
     prompts: "",   // raw timestamped script persisted in the manifest
     imageWarning: "",  // server note when two uploads are the same picture
+    thumbs: [],        // tiny server-made copies for the filmstrip ([] = use images)
   };
 
   // Waveform peaks cache: recomputed only when the audio URL changes.
@@ -123,6 +124,9 @@
   let draggedRecently = 0;
   let persistTimer = null;
   let copyLabelTimer = null;   // flips the beats "Copy" label back after 2.2s
+  // Optimistic image tiles: painted from local blob previews while the
+  // upload is still in flight (see showPendingImage below).
+  let pendingNodes = [];
   let pinnedClip = -1;   // clip index held during drag/resize so the preview doesn't flip
 
   // ─────────────────────────────────────────────────────────────
@@ -216,7 +220,14 @@
   function applyServerData(data) {
     const images = data.image_urls || [];
     const segments = data.segments || [];
-    const sig = `${images.length}:${segments.length}:${data.status}`;
+    // Thumbnails: the filmstrip paints tiny server-made copies instead of
+    // the 1920px originals (a 20-image job pulled ~10MB just to draw small
+    // tiles). Index-aligned with `images`, with null where none exists.
+    // The count joins the fingerprint so a job that gains thumbnails after
+    // this page load repaints exactly once.
+    const thumbList = Array.isArray(data.image_thumbs) ? data.image_thumbs : [];
+    const sig = `${images.length}:${thumbList.filter(Boolean).length}:`
+      + `${segments.length}:${data.status}`;
 
     state.hasAudio = !!data.has_audio;
     playMode = state.hasAudio ? "audio" : "timer";
@@ -241,6 +252,7 @@
 
     const rebuild = sig !== state.sig || !state.clips.length;
     state.images = images;
+    state.thumbs = thumbList;
     state.segments = segments;
     state.matched = !!data.matched;
     state.sig = sig;
@@ -426,6 +438,9 @@
 
   function render() {
     const total = totalDuration();
+    // Any optimistic placeholders are superseded by the real blocks the
+    // render below paints (render() owns the filmstrip's contents).
+    pendingNodes = [];
     imageTrack.innerHTML = "";
 
     // The playhead is created once and reused: render() runs after every
@@ -449,8 +464,11 @@
       // Filmstrip: the picture is painted as a repeating background at a
       // constant scale (see .sync-img-block), so a longer clip only shows
       // more of the strip - the photo itself never magnifies.
-      if (state.images[clip.image]) {
-        block.style.backgroundImage = `url("${state.images[clip.image]}")`;
+      // Thumbnail first: it is ~10-20x lighter and this is a small tile.
+      // The full image stays for the big preview and the export.
+      const tile = state.thumbs[clip.image] || state.images[clip.image];
+      if (tile) {
+        block.style.backgroundImage = `url("${tile}")`;
       }
       block.innerHTML =
         `<span class="blockNum">${i + 1}</span>`
@@ -1236,8 +1254,11 @@
     if (files.length) {
       // Downscale in the browser first: 1920px is the render target, so
       // full-res phone photos are pure upload weight (5-20x smaller).
-      showMsg(`Preparing ${files.length} image${files.length > 1 ? "s" : ""}…`);
-      const prepared = await window.shrinkImagesForUpload(files);
+      // Every finished image is also painted right away, so the timeline
+      // fills in during preparation instead of after a silent wait.
+      const prepared = await window.shrinkImagesForUpload(
+        files, (file) => showPendingImage(file)
+      );
       uploadImages(prepared);
     }
   });
@@ -1256,6 +1277,36 @@
       + (state.hasAudio ? "ready" : "awaiting_audio");
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // Optimistic image tiles
+  //
+  // Each picked image is painted into the filmstrip from a local blob
+  // preview (image-shrink.js makes one per file) the moment its copy
+  // exists - so the timeline fills in while preparation and upload are
+  // still running. These nodes live OUTSIDE state (state stays
+  // server-owned) and are dropped by the render() that follows a
+  // successful upload, or by clearPendingImages() when it fails.
+  // ─────────────────────────────────────────────────────────────
+
+  /** Append one placeholder tile for a still-uploading image. */
+  function showPendingImage(file) {
+    if (!file || !file.previewUrl) return;
+    const block = document.createElement("div");
+    block.className = "sync-img-block pending";
+    block.style.width = `${MIN_BLOCK_PX}px`;
+    block.style.backgroundImage = `url("${file.previewUrl}")`;
+    block.innerHTML =
+      `<span class="blockNum">${pendingNodes.length + 1}</span>`
+      + `<span class="blockDur">…</span>`;
+    imageTrack.appendChild(block);
+    pendingNodes.push(block);
+  }
+
+  function clearPendingImages() {
+    pendingNodes.forEach((node) => node.remove());
+    pendingNodes = [];
+  }
+
   async function uploadImages(files) {
     showMsg(`Uploading ${files.length} image${files.length > 1 ? "s" : ""}…`);
     try {
@@ -1265,10 +1316,15 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Image upload failed");
       const urls = Array.isArray(data.image_urls) ? data.image_urls : [];
+      const thumbs = Array.isArray(data.image_thumbs) ? data.image_thumbs : [];
       const base = state.images.length;
+      // Older jobs carry no thumbnails, so pad the list before appending
+      // and keep it index-aligned with state.images.
+      while (state.thumbs.length < base) state.thumbs.push(null);
       urls.forEach((url, k) => {
         state.images.push(url);
         state.clips.push({ image: base + k, duration: DEFAULT_CLIP_SECONDS });
+        state.thumbs.push(thumbs[k] || null);
       });
       adoptServerSync(data);
       reapplySavedPrompts();  // new images line up to the saved script
@@ -1284,6 +1340,8 @@
         showMsg("Added images - drag to arrange, then Export.");
       }
     } catch (err) {
+      // The placeholders stand in for images that never arrived.
+      clearPendingImages();
       showMsg(err.message, true);
     }
   }
