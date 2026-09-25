@@ -158,13 +158,21 @@ def _get_whisper_model():
 
 
 def warm_whisper():
-    """Pre-load the transcription model in the background.
+    """Pre-load the local model in the background - but ONLY when it is an
+    engine this deployment will actually use.
 
-    Called once at app startup so the FIRST user of a fresh process does
-    not pay the model-load (and possible one-time weight download) wait
-    inside their upload request. Never raises: if the engine cannot load
-    the request path will surface the error as usual via its own fallback.
+    Called once at app startup so the first local transcription does not
+    pay the model-load (and possible one-time weight download) wait. It is
+    SKIPPED when faster-whisper is disabled (STT_LOCAL=0) or is not part
+    of the chain: on a 512MB host the ~75MB weights download plus a
+    resident model is the single most expensive thing on the box, and a
+    Groq/OpenAI deployment never transcribes locally - it was measured
+    starving the very API call that was doing the work. Never raises.
     """
+    if not _should_warm_local():
+        print("[sync] whisper warm-up skipped: local engine not in use")
+        return
+
     def _warm():
         try:
             _get_whisper_model()
@@ -317,6 +325,31 @@ def _local_enabled():
     )
 
 
+def _api_configured():
+    """True when at least one API engine has credentials in this process."""
+    if os.getenv("GROQ_API_KEY", "").strip():
+        return True
+    return bool(os.getenv("OPENAI_API_KEY") or os.getenv("WHISPER_API_KEY"))
+
+
+def _should_warm_local():
+    """Whether to pre-load faster-whisper at startup.
+
+    Derived from the RESOLVED chain, so the STT_LOCAL=0 fail-safe (which
+    puts local back as the only engine) still gets a warm model. When an
+    API engine is configured, local stays in the chain as a LAST RESORT
+    (loaded lazily, and only if an API call actually fails) - but a Groq
+    deployment must not pay a ~75MB weights download plus a resident
+    model on every cold start: on a 512MB host that starves the API call
+    doing the real work.
+    """
+    if "local" not in _engine_order():
+        return False
+    if os.getenv("STT_ENGINE", "auto").strip().lower() == "local":
+        return True
+    return not _api_configured()
+
+
 def _engine_order():
     """Engines to try: STT_ENGINE pins one, otherwise Groq first."""
     pinned = os.getenv("STT_ENGINE", "auto").strip().lower()
@@ -329,7 +362,22 @@ def _engine_order():
             f"Unknown STT_ENGINE={pinned!r} (use auto, groq, local or openai)."
         )
     if "local" in order and not _local_enabled():
-        order.remove("local")
+        # Dropping local is only safe while an API engine can take the job.
+        api_ok = (
+            ("groq" in order and os.getenv("GROQ_API_KEY", "").strip())
+            or ("openai" in order and (
+                os.getenv("OPENAI_API_KEY") or os.getenv("WHISPER_API_KEY")
+            ))
+        )
+        if api_ok or pinned not in ("", "auto"):
+            order.remove("local")
+        else:
+            # Misconfiguration guard: STT_LOCAL=0 with no API engine
+            # configured would fail every job. Keep local and say so.
+            print("[sync] STT_LOCAL=0 but no API engine is configured "
+                  "(GROQ_API_KEY / OPENAI_API_KEY) - using faster-whisper "
+                  "anyway so jobs keep working")
+            order = ["local"]
     return order
 
 

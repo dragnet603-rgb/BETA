@@ -106,6 +106,7 @@
     prompts: "",   // raw timestamped script persisted in the manifest
     imageWarning: "",  // server note when two uploads are the same picture
     thumbs: [],        // tiny server-made copies for the filmstrip ([] = use images)
+    engine: "",        // which engine transcribed the voiceover (groq/local/openai)
   };
 
   // Waveform peaks cache: recomputed only when the audio URL changes.
@@ -257,6 +258,11 @@
     state.matched = !!data.matched;
     state.sig = sig;
     state.status = typeof data.status === "string" ? data.status : "";
+    // Only overwrite once the server knows an engine: older deployments
+    // simply do not send the field.
+    if (typeof data.transcript_engine === "string" && data.transcript_engine) {
+      state.engine = data.transcript_engine;
+    }
     if (typeof data.prompts === "string") state.prompts = data.prompts;
     // Server-side duplicate-picture note (it owns the stored files, and
     // only it can hash them): "" clears a stale note after a re-upload.
@@ -1991,11 +1997,15 @@
 
       const secs = Math.round((Date.now() - started) / 1000);
       if (beatsProgressText) {
+        // "via groq" is the only way a user can tell which engine is
+        // actually doing the work - a slow server run looks identical
+        // otherwise.
+        const via = state.engine ? ` - via ${state.engine}` : "";
         beatsProgressText.textContent = secs > 90
-          ? `Transcribing voiceover… (${secs}s) - a cold start after a `
-            + "deploy can take a few minutes"
+          ? `Transcribing voiceover… (${secs}s)${via} - a cold start `
+            + "after a deploy can take a few minutes"
           : secs > 0
-            ? `Transcribing voiceover… (${secs}s)`
+            ? `Transcribing voiceover… (${secs}s)${via}`
             : "Transcribing voiceover…";
       }
       await new Promise((r) => setTimeout(r, 1500));

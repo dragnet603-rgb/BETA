@@ -7,6 +7,7 @@ chain docs at the top of sync_pipeline.py).
 
 import os
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -98,6 +99,7 @@ class TestEngineOrder(EngineTestBase):
 
     def test_stt_local_zero_drops_local(self):
         os.environ["STT_LOCAL"] = "0"
+        os.environ["GROQ_API_KEY"] = "gsk_test"
         self.assertEqual(sync_pipeline._engine_order(), ["groq", "openai"])
 
     def test_groq_client_none_without_key(self):
@@ -167,6 +169,89 @@ class TestChain(EngineTestBase):
             segments, words = sync_pipeline.transcribe(Path("x.mp3"))
         self.assertEqual(segments, SEGS)
         self.assertEqual(words, WORDS)
+
+
+class TestLocalEngineSelection(EngineTestBase):
+    """Which engines this deployment uses, and which one it pre-loads."""
+
+    def test_local_kept_when_no_api_configured(self):
+        self.assertEqual(
+            sync_pipeline._engine_order(), ["groq", "local", "openai"]
+        )
+        self.assertTrue(sync_pipeline._should_warm_local())
+
+    def test_local_stays_in_chain_as_last_resort(self):
+        # A Groq deployment keeps faster-whisper available (lazy-loaded only
+        # if an API call actually fails) - it just never pre-loads it.
+        os.environ["GROQ_API_KEY"] = "gsk_test"
+        self.assertEqual(
+            sync_pipeline._engine_order(), ["groq", "local", "openai"]
+        )
+        self.assertFalse(sync_pipeline._should_warm_local())
+
+    def test_stt_local_zero_drops_local(self):
+        os.environ["STT_LOCAL"] = "0"
+        os.environ["GROQ_API_KEY"] = "gsk_test"
+        self.assertEqual(sync_pipeline._engine_order(), ["groq", "openai"])
+        self.assertFalse(sync_pipeline._should_warm_local())
+
+    def test_local_pinned_wins_over_api(self):
+        os.environ["STT_ENGINE"] = "local"
+        os.environ["GROQ_API_KEY"] = "gsk_test"
+        self.assertEqual(sync_pipeline._engine_order(), ["local"])
+        self.assertTrue(sync_pipeline._should_warm_local())
+
+    def test_openai_key_also_counts_as_api(self):
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        self.assertFalse(sync_pipeline._should_warm_local())
+        self.assertEqual(
+            sync_pipeline._engine_order(), ["groq", "local", "openai"]
+        )
+
+    def test_failsafe_keeps_local_when_no_api_at_all(self):
+        # STT_LOCAL=0 with no API key would leave nothing to transcribe
+        # with and fail every job - local is used anyway.
+        os.environ["STT_LOCAL"] = "0"
+        self.assertEqual(sync_pipeline._engine_order(), ["local"])
+        self.assertTrue(sync_pipeline._should_warm_local())
+
+
+class TestWarmWhisper(EngineTestBase):
+    """The warm-up must not download/load a model the chain will not use."""
+
+    def _warm_calls(self, env):
+        for key, val in env.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        calls = []
+        with mock.patch.object(
+            sync_pipeline, "_get_whisper_model", lambda: calls.append(1)
+        ):
+            sync_pipeline.warm_whisper()
+        time.sleep(0.05)        # the warm-up runs in a daemon thread
+        return calls
+
+    def test_no_warmup_when_groq_configured(self):
+        # The regression: a Groq deployment was downloading ~75MB of
+        # faster-whisper weights on every cold start.
+        self.assertEqual(self._warm_calls({"GROQ_API_KEY": "gsk_test"}), [])
+
+    def test_no_warmup_when_local_disabled(self):
+        calls = self._warm_calls(
+            {"STT_LOCAL": "0", "GROQ_API_KEY": "gsk_test"}
+        )
+        self.assertEqual(calls, [])
+
+    def test_warmup_runs_for_local_only_deployment(self):
+        self.assertEqual(len(self._warm_calls({})), 1)
+
+    def test_warmup_runs_when_local_pinned(self):
+        calls = self._warm_calls(
+            {"STT_ENGINE": "local", "GROQ_API_KEY": "gsk_test"}
+        )
+        self.assertEqual(len(calls), 1)
 
 
 class TestGroqEngine(EngineTestBase):

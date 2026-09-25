@@ -35,6 +35,17 @@ import modal_ffmpeg_client  # noqa: E402  (cloud-GPU export proxy + local fallba
 import sync_pipeline  # noqa: E402  (images + voiceover -> synced video jobs)
 import beat_planner  # noqa: E402  (offline voiceover -> visual beat plan)
 
+# Load .env BEFORE anything reads os.getenv below - including the
+# transcription warm-up a few lines down, which decides whether to
+# pre-load faster-whisper based on the configured API engines. It used to
+# run later in the file, so a local .env was invisible to it and every
+# start paid a ~75MB model download even with GROQ_API_KEY configured.
+# (Firebase/stats/mailer do the same at their own import time, for the
+# same reason.)
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv()
+
 
 # ============================================================
 # AUTOQUENCE APP
@@ -193,8 +204,6 @@ ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
 SYNC_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif", "bmp"}
 SYNC_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "aac", "ogg", "flac", "webm"}
 
-from dotenv import load_dotenv
-load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
@@ -1263,6 +1272,9 @@ def _sync_status_payload(job_id, manifest):
     adoption route so the page can apply it exactly like a status poll."""
     response = {
         "status": manifest.get("status", "unknown"),
+        # Which engine produced the transcript (groq | local | openai) -
+        # lets the page say so instead of leaving "Transcribing..." a mystery.
+        "transcript_engine": manifest.get("transcript_engine"),
         # When the manifest last changed: lets the UI (and post-mortems)
         # tell a slow-but-alive transcription from a dead one.
         "updated_at": manifest.get("updated_at"),
