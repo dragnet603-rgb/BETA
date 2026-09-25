@@ -50,7 +50,6 @@ document.addEventListener("DOMContentLoaded", () => {
   // DOM
   // ─────────────────────────────────────────────────────────────
   const videoEl      = document.getElementById("videoPreview");
-  const form         = document.getElementById("promptForm");
   const container    = document.querySelector(".canvas");
   const expBtn       = document.getElementById("Export");
   const playPauseBtn = document.getElementById("playPauseBtn");
@@ -83,8 +82,8 @@ document.addEventListener("DOMContentLoaded", () => {
     return {
       version: 0,
       canvas: {
-        width:       1080,
-        height:      1920,
+        width:       1920,
+        height:      1080,
         aspectRatio: null,
         background:  null,
         speed:       1.0,
@@ -674,7 +673,7 @@ document.addEventListener("DOMContentLoaded", () => {
       // FIT mode: the video is always fully visible (letterboxed when
       // its aspect differs from the canvas). Bars are the container
       // background — matching exports, which fit the picture inside a
-      // fixed 9:16 frame and pad with the background color.
+      // fixed 16:9 frame and pad with the background color.
       objectFit: "contain",
       transform: "",
       margin: "",
@@ -700,7 +699,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // whole selection is always visible, letterboxed with background bars).
   // A clip-path below chops everything OUTSIDE the selection (the rest of
   // the rendered source frame) — matching exports, which fit the picture
-  // inside the fixed 9:16 frame and pad with the background color.
+  // inside the fixed 16:9 frame and pad with the background color.
   const scale = Math.min(
     cw / cropW,
     ch / cropH
@@ -1026,22 +1025,22 @@ document.addEventListener("DOMContentLoaded", () => {
   // TYPOGRAPHY ENGINE
   //
   // Single source of truth for text sizing. ALL sizes are expressed
-  // at OUTPUT resolution (scene.canvas.width, 1080-wide), then scaled
+  // at OUTPUT resolution (scene.canvas.width, 1920-wide), then scaled
   // into preview px by kOut. Preview, the WebCodecs export engine and
   // the FFmpeg fallback all consume the same measured layout, so text
   // renders identically everywhere.
   // ============================================================
   const AQ_TYPO = {
-    // "Middle" caption size at 1080-wide output — readable, not chunky.
+    // "Middle" caption size at 1920-wide output — readable, not chunky.
     banner: { defaultFs: 56, minFs: 24, lineHeight: 1.15,
               padFrac: 0.45, minPad: 10, capFrac: 0.4 },
     text:   { defaultFs: 26, maxFs: 40, lineHeight: 1.25, pad: 8 },
   };
   window.__AQ_TYPO__ = AQ_TYPO;
 
-  /** preview px -> output px factor (container and output are both 9:16) */
+  /** preview px -> output px factor (container and output are both 16:9) */
   function kOutFactor() {
-    return (scene.canvas.width || 1080) / Math.max(1, container.clientWidth || 1080);
+    return (scene.canvas.width || 1920) / Math.max(1, container.clientWidth || 1920);
   }
   function outPxToPreviewPx(out) { return out / kOutFactor(); }
   function previewPxToOutPx(px)  { return px * kOutFactor(); }
@@ -1060,8 +1059,8 @@ document.addEventListener("DOMContentLoaded", () => {
    */
   function layoutBannerText(text, fontFamily, fontStyle, reqFsOut, cacheObj) {
     const T = AQ_TYPO.banner;
-    const OUT_W = scene.canvas.width || 1080;
-    const OUT_H = scene.canvas.height || 1920;
+    const OUT_W = scene.canvas.width || 1920;
+    const OUT_H = scene.canvas.height || 1080;
 
     const key = `${text}|${fontFamily}|${fontStyle}|${Math.round(reqFsOut)}`;
     if (cacheObj && cacheObj._layoutKey === key && cacheObj._layout) {
@@ -2942,8 +2941,8 @@ function _renderBanner(el) {
     // Canvas
     if (ss.canvas) {
       scene.canvas = {
-        width:       ss.canvas.width       || 1080,
-        height:      ss.canvas.height      || 1920,
+        width:       ss.canvas.width       || 1920,
+        height:      ss.canvas.height      || 1080,
         aspectRatio: ss.canvas.aspect_ratio || ss.canvas.aspectRatio || null,
         background:  ss.canvas.background  || null,
         speed:       ss.canvas.speed       || 1.0,
@@ -4185,47 +4184,6 @@ function _renderBanner(el) {
     return true;
   }
 
-  form?.addEventListener("submit", async e => {
-    e.preventDefault();
-    const btn   = document.querySelector(".uploadBtn");
-    const input = form.querySelector("input, textarea");
-    if (!input) return;
-    const prompt = input.value.trim();
-    if (!prompt) return;
-    // Free-tier prompt analytics: every typed prompt is captured here
-    // (covers both the local trim/split fast-path and server round trips).
-    try { window.posthog?.capture("prompt_sent", { prompt }); } catch (_) {}
-    // Trim/split fast-path BEFORE any loading state or server call.
-    if (_maybeOpenTrimTimelineFast(prompt)) { input.value = ""; return; }
-    if (btn) { btn.classList.add("loading"); btn.disabled = true; }
-    // Lightweight "generating" state: subtle blur + a small pulsing chip.
-    // It is dismissed at the TOP of handleResult() — i.e. the moment the
-    // AI's plan arrives — so the materialization animations play on a
-    // clean, unobstructed canvas.
-    if (!looksLikeConversation(prompt)) {
-      showEditOverlay();
-    } else {
-      // Conversation / clarification prompts get the rotating "thinking…"
-      // bubble while the AI responds. Edit requests skip it — the canvas
-      // "Generating" chip + materialization animations are their progress UI.
-      showThinking();
-    }
-    // NOTE: no showThinking() response bubble during the edit — the canvas
-    // "Generating" chip + the materialization animations are the progress UI.
-    // The AI's summary bubble appears once the edit finishes (see handleResult).
-    try {
-      await sendPrompt(prompt);
-      input.value = "";
-    } catch(err) {
-      console.error("[PROMPT ERROR]", err);
-      showMsg(`Error: ${err.message}`, { type: "error", sticky: true });
-    } finally {
-      hideThinking(); // safety net (no-op if showMsg already replaced the bubble)
-      hideEditOverlay(); // safety net (no-op if handleResult already hid it)
-      if (btn) { btn.classList.remove("loading"); btn.disabled = false; }
-    }
-  });
-
   // ─────────────────────────────────────────────────────────────
   // CLIENT-SIDE EXPORT BRIDGE
   //
@@ -4562,13 +4520,13 @@ function _renderBanner(el) {
     if (scene.canvas.speed && scene.canvas.speed !== 1.0) edits.push({ type: "speed", speed: scene.canvas.speed });
     if (scene.canvas.trim) edits.push({ type: "trim", ...scene.canvas.trim });
 
-    // Exports are ALWAYS 9:16 (1080x1920) in FIT mode: the picture is
+    // Exports are ALWAYS 16:9 (1920x1080) in FIT mode: the picture is
     // fitted and centered inside the frame (letterbox bars filled with
     // the scene background) — identical to the client-side engine and
     // the preview. The legacy server path scales to fit and pads.
     edits.push({
       type: "resize_canvas",
-      aspect_ratio: "9:16",
+      aspect_ratio: "16:9",
       color: scene.canvas.background || "#000000",
     });
 
@@ -4591,7 +4549,7 @@ function _renderBanner(el) {
         // letterbox-proof: the server multiplies it by the cropped
         // frame height, so the drawn banner is the same size relative to
         // the picture as in the preview — even when the picture doesn't
-        // span the full 1080x1920 output frame.
+        // span the full 1920x1080 output frame.
         const _vr = getVideoRect();
         const heightFrac = _vr.h > 0
           ? Math.min(1, Math.max(0, (el._pixelHeight || 0) / _vr.h))
@@ -4638,7 +4596,7 @@ function _renderBanner(el) {
           id:         el.id,
           text:       p.text || p.content || "",
           text_color: p.color || p.textColor || p.text_color || "#ffffff",
-          // Preview default comes from the typography engine (30px @1080).
+          // Preview default comes from the typography engine (30px @1920).
           font_size:     Number(p.fontSize || p.font_size || outPxToPreviewPx(AQ_TYPO.text.defaultFs)),
           font_size_out: Math.round(Number(p.fontSize || p.font_size || outPxToPreviewPx(AQ_TYPO.text.defaultFs)) * kOutFactor()),
           // Exact normalized rect — replaces the lossy top/center/bottom
@@ -4703,6 +4661,9 @@ function _renderBanner(el) {
   // detectContentBars() can scan a real frame and snap banners to the
   // first row of picture content (a metadata-time render scans nothing).
   videoEl.addEventListener("loadeddata", () => {
+    // First real frame decoded — reveal the video. Until now it stays
+    // hidden so a pending/failed decode can never flash a white box.
+    videoEl.classList.add("frame-ready");
     renderScene();
   });
 
@@ -4715,27 +4676,25 @@ function _renderBanner(el) {
     renderScene();
   });
 
+  // A failed/unsupported decode (e.g. HEVC without a system codec) can
+  // paint a blank WHITE frame. Drop back to the dark placeholder.
+  videoEl.addEventListener("error", () => {
+    videoEl.classList.remove("frame-ready");
+  });
+
   if (videoEl.readyState >= 1) {
     scene.video.naturalWidth  = videoEl.videoWidth;
     scene.video.naturalHeight = videoEl.videoHeight;
     scene.video.duration      = videoEl.duration;
     scene.video.filename      = getFilename();
   }
+  // A cached video may already have a decodable frame when the script
+  // first runs (readyState >= 2 = current frame available) — reveal it.
+  if (videoEl.readyState >= 2) videoEl.classList.add("frame-ready");
 
   // ─────────────────────────────────────────────────────────────
   // MOBILE KEYBOARD
   // ─────────────────────────────────────────────────────────────
-  const promptInputEl = document.querySelector(".promptInput");
-  let _kbOpen = false, _kbTimer = null;
-  promptInputEl?.addEventListener("focus", () => {
-    clearTimeout(_kbTimer);
-    setTimeout(() => { _kbOpen = true; document.body.classList.add("keyboard-open"); }, 100);
-  });
-  promptInputEl?.addEventListener("blur", () => {
-    clearTimeout(_kbTimer);
-    _kbTimer = setTimeout(() => { _kbOpen = false; document.body.classList.remove("keyboard-open"); }, 300);
-  });
-
   // ─────────────────────────────────────────────────────────────
   // CHUNK UPLOAD
   // ─────────────────────────────────────────────────────────────

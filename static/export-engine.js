@@ -1,7 +1,7 @@
 /**
  * Autoquence — client-side export engine (no FFmpeg).
  *
- * OUTPUT: every export is a fixed 9:16 frame (1080x1920) in FIT mode:
+ * OUTPUT: every export is a fixed 16:9 frame (1920x1080) in FIT mode:
  * the picture is always FULLY VISIBLE, fitted and centered — mismatched
  * source aspect ratios are letterboxed (bars filled with the scene
  * background color) instead of being zoom-cropped.
@@ -25,9 +25,9 @@
 
   const FPS = 30;
 
-  // Every export is always 9:16 regardless of source aspect.
-  const OUTPUT_W = 1080;
-  const OUTPUT_H = 1920;
+  // Every export is always 16:9 regardless of source aspect.
+  const OUTPUT_W = 1920;
+  const OUTPUT_H = 1080;
 
   // ─────────────────────────────────────────────────────────────
   // Small helpers
@@ -220,7 +220,7 @@
   //
   // The output frame corresponds EXACTLY to the preview's video viewport
   // (getVideoRect()). The picture is ALWAYS fully visible inside the
-  // 9:16 frame — fitted and centered, with letterbox/pillarbox bars
+  // 16:9 frame — fitted and centered, with letterbox/pillarbox bars
   // filled by the scene background color.
   // ─────────────────────────────────────────────────────────────
   function computeOutput(bridge, scene, meta) {
@@ -232,13 +232,13 @@
     // truth, set in canvas.js createEmptyScene); fall back to the engine
     // defaults for legacy scenes that don't carry it.
     //
-    // HARD GUARANTEE: every export is fixed 9:16 (1080x1920) regardless of
+    // HARD GUARANTEE: every export is fixed 16:9 (1920x1080) regardless of
     // scene.canvas dimensions — matching the server FFmpeg path which forces
-    // scale=1080:1920 + pad + setsar=1. This keeps client and server exports
-    // byte-consistent and guarantees the "9:16" contract even if a resize
-    // action ever set a non-9:16 canvas.
-    const OUT_W = 1080;
-    const OUT_H = 1920;
+    // scale=1920:1080 + pad + setsar=1. This keeps client and server exports
+    // byte-consistent and guarantees the "16:9" contract even if a resize
+    // action ever set a non-16:9 canvas.
+    const OUT_W = 1920;
+    const OUT_H = 1080;
 
     // Base source region (source pixels): the committed crop selection,
     // or the full frame when uncropped.
@@ -267,7 +267,7 @@
 
     // Map the preview video rect onto the output frame with FIT
     // semantics (min — never crop). placedW/H is the letterboxed video
-    // area; offX/offY center it inside the 9:16 frame.
+    // area; offX/offY center it inside the 16:9 frame.
     const k = Math.min(OUT_W / anchor.w, OUT_H / anchor.h);
     const placedW = anchor.w * k;
     const placedH = anchor.h * k;
@@ -616,7 +616,7 @@
   // Overlay plate for the cloud-GPU (Modal) export path.
   //
   // Renders EVERYTHING except the video and the letterbox background onto a
-  // single TRANSPARENT 1080x1920 canvas, exactly like a single frame would
+  // single TRANSPARENT 1920x1080 canvas, exactly like a single frame would
   // composite for the client path — but as one static image. Shapes, banners
   // and free text are baked in at output resolution using the same fit math
   // (geom.offX/offY/placedW/placedH) as buildStaticLayers, so the plate lines
@@ -674,7 +674,7 @@
       return;
     }
 
-    // 1. Background — fills the WHOLE 9:16 frame; only visible in the
+    // 1. Background — fills the WHOLE 16:9 frame; only visible in the
     //    unlikely event the video placement leaves a rounding gap.
     const scene = window.__AQ_CANVAS_BRIDGE__.getScene();
     ctx.fillStyle = scene.canvas.background || "#000000";
@@ -901,7 +901,7 @@
 
     const geom = state.geom, tl = state.tl;
 
-    // bits-per-pixel factor tuned for crisp H.264 at 1080x1920@30:
+    // bits-per-pixel factor tuned for crisp H.264 at 1920x1080@30:
     // ~7.5 Mbps for the standard output frame (old value: ~4.35 Mbps,
     // which made motion-heavy exports look soft/blocky).
     const bitrate = Math.round(clamp(geom.width * geom.height * FPS * 0.12, 8000000, 24000000));

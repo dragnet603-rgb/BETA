@@ -12,7 +12,6 @@ transition: background-color 9999s ease-in-out 0s;
 Tap highlight removal
 ========================= */
 .export,
-.uploadBtn,
 .play {
 -webkit-tap-highlight-color: transparent;
 }
@@ -40,7 +39,7 @@ left:3vw;
 .promptrText h1 {
 color: white;
 font-family: sans-serif;
-font-size: 6vw;
+font-size: clamp(24px, 7vw, 40px);
 margin: 0;
 
 }
@@ -62,7 +61,7 @@ transition: 0.1s ease;
 .export h1 {
 color: white;
 font-family: sans-serif;
-font-size: 3vw;
+font-size: clamp(11px, 2vw, 16px);
 pointer-events: none;
 }
 .export:active {
@@ -77,17 +76,21 @@ Video container
 ========================= */
 .canvas-container {
   position: relative;
-  width: 100vw;
-  max-width: 200px;
-  aspect-ratio: 9 / 16;
-  border: 10px transparent rgb(2, 2, 2);
-  
-  background: rgba(48, 44, 44, 0.9);
+  /* 16:9 landscape frame. The height-aware term converts leftover
+     vertical space into the widest 16:9 box that fits while still
+     leaving room below for the play button (chrome ~= 320px; the
+     centered layout splits the remaining space evenly top/bottom). */
+  width: max(200px, min(94vw, 560px, calc((100dvh - 320px) * 16 / 9)));
+  aspect-ratio: 16 / 9;
+  border: 1px solid transparent;
+
+  background: rgb(2, 2, 2);
   border-radius: 20px;
 
   overflow: visible;
 
-  margin-bottom: 15vh;
+  /* Small bottom margin — the timeline panel lives below the canvas. */
+  margin-bottom: 2vh;
 
   transform: scale(1);
   transform-origin: center center;
@@ -99,8 +102,11 @@ Video container
   height: 100%;
   position: relative;
   overflow: hidden;
-  border-radius: 20px;
-  
+  border-radius: 30px;
+  /* Letterbox/pillarbox gaps show this layer: match the page so the
+     fitted video's edges blend invisibly instead of reading pale. */
+  background: rgb(2, 2, 2);
+  border: none;
 }
 
 body.keyboard-open .canvas-container {
@@ -131,14 +137,20 @@ body.keyboard-open {
 width: 100%;
 height: 100%;
 object-fit: contain;
-
+/* The video element's own box can peek out around the fitted frame.
+   outline removes the pale native edge some browsers paint there;
+   it draws outside the box, so geometry is untouched. */
+background: rgb(2, 2, 2);
+outline: 1px solid rgb(2, 2, 2);
+outline-offset: -1px;
+/* Until the first real frame decodes, some browsers paint a blank
+   WHITE box (pending or failed hardware decode). Keep the video
+   hidden so the dark container shows instead; canvas.js reveals it
+   on "loadeddata" (first frame) and re-hides on decode errors. */
+visibility: hidden;
 }
-canvas#videoCanvas {
-position: absolute;
-inset: 0;
-width: 100%;
-height: 100%;
-pointer-events: none;
+.canvas video.frame-ready {
+visibility: visible;
 }
 
 
@@ -471,107 +483,6 @@ max-width: 90%;
 word-wrap: break-word;
 pointer-events: none;
 }
-/* =========================
-Input bar
-========================= */
-.inputWrapper {
-position: fixed;
-bottom: 2vh;
-left: 50%;
-transform: translateX(-50%);
-width: 90%;
-max-width: 310px;
-height: 4vh;
-/* background-color: rgb(66, 63, 63); */
-background-color: rgba(48, 44, 44, 0.9);
-border-radius: 40px;
-display: flex;
-align-items: center;
-gap: 5px;
-padding: 15px;
-z-index: 9999;
-
-
-}
-.promptInput {
-flex: 1;
-min-width: 0;
-border: none;
-outline: none;
-background: transparent;
-color: white;
-font-size: 4vw;
-transform: translateX(10px);
-
-}
-.uploadBtn {
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-  transform: translateX(4px);
-}
-
-.uploadBtn img {
-  width: 40%;
-  height: auto;
-  object-fit: contain;
-}
-
-.uploadBtn:active {
-  transform: translateX(6px) translateY(2px) scale(0.95);
-}
-
-.uploadBtn.loading {
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  background: greenyellow;
-  border-radius: 50%;
-  pointer-events: none;
-
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.uploadBtn.loading img {
-  display: none;
-}
-
-.uploadBtn.loading::after {
-  content: "•••";
-  color: white;
-  font-size: 16px;
-  letter-spacing: 2px;
-  line-height: 1;
-  animation: dots 1s infinite;
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-
-
-}
-
-@keyframes dots {
-  0%, 20% {
-    opacity: 0.2;
-  }
-
-  50% {
-    opacity: 1;
-  }
-
-  100% {
-    opacity: 0.2;
-  }
-}
 .canvas.processing video {
   filter: blur(4px) brightness(0.78);
   transition: filter 0.35s ease;
@@ -862,14 +773,14 @@ green #2dee06 / greenyellow on dark, rounded pills)
 ========================= */
 #trimControls {
   position: fixed;
-  /* Sits in the gap BETWEEN the canvas and the prompt input bar
-     (prompt wrapper is 4vh + 15px padding ≈ 84px tall). */
-  bottom: calc(2vh + 60px);
+  /* The prompt input bar was removed — trim controls now sit just above
+     the bottom edge of the viewport. */
+  bottom: 2vh;
   left: 50%;
   transform: translateX(-50%);
   width: 94%;
   max-width: 430px;
-  
+
   border-radius: 20px;
   display: flex;
   flex-direction: column;
@@ -921,38 +832,15 @@ green #2dee06 / greenyellow on dark, rounded pills)
 TABLET+
 ========================= */
 @media (min-width: 768px) {
-.promptrText h1 {
-font-size: 4vw;
-}
-.export h1 {
-font-size: 1.5vw;
-}
 .textOverlay {
 font-size: 2.5vw;
-}
-.promptInput {
-font-size: 2vw;
-}
-.uploadBtn {
-width: 6vw;
-height: 6vw;
 }
 }
 /* =========================
 DESKTOP
 ========================= */
 @media (min-width: 1200px) {
-.promptrText h1 {
-font-size: 1vw;
-}
-.export h1 {
-font-size: 1vw;
-}
 .textOverlay {
 font-size: 2vw;
-}
-.promptInput {
-font-size: 1.5vw;
-max-width: 700px;
 }
 }

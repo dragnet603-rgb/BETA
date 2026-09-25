@@ -35,7 +35,6 @@
     })
     </script>
   </head>
-  </head>
   <body>
     <div class="promptrText">
       <h1>Autoquence</h1>
@@ -46,29 +45,27 @@
 
     <div id="addP" class="addPage">+</div>
 
+    <!-- Hidden picker for the + button: images AND/OR a voiceover.
+         A voiceover alone is a valid start: it transcribes, the beats
+         suggest how many images to make, and images are added later on
+         the sync page. A voiceover can also still be added later there. -->
+    <input
+      type="file"
+      id="imageInput"
+      accept="image/*,audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac"
+      multiple
+      style="display: none"
+    />
+
     <div class="tapInstruction">
-      <form
-        id="uploadForm"
-        action="{{ url_for('upload') }}"
-        method="POST"
-        enctype="multipart/form-data"
-      >
-        <input
-          type="file"
-          id="videoInput"
-          name="video"
-          accept="video/*"
-          style="display: none"
-        />
-      </form>
-      <p>Tap the icon to add a short video</p>
+      <p id="pickHint">Tap + to add images and/or your voiceover</p>
     </div>
 
     <!-- Upload overlay -->
     <div id="uploadOverlay" style="display: none">
       <div id="uploadCard">
         <div id="spinnerRing"></div>
-        <p id="uploadLabel">Uploading video…</p>
+        <p id="uploadLabel">Uploading images…</p>
         <div id="progressTrack">
           <div id="progressBar"></div>
         </div>
@@ -78,6 +75,7 @@
 
     <!-- Scripts go LAST so they can find the overlay div above -->
     <!-- <script src="{{ url_for('static', filename='script.js') }}"></script> -->
+    <script src="{{ static_v('image-shrink.js') }}"></script>
     <script src="{{ static_v('upload.js') }}"></script>
     <!-- Firebase config must load BEFORE auth.js (module) -->
     <script src="{{ static_v('firebase-config.js') }}"></script>

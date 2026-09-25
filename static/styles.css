@@ -8,6 +8,100 @@ body {
   margin: 0;
 }
 
+/* ============================================================
+   SYNC UPLOAD — image + voiceover picker (minimal dark style)
+   ============================================================ */
+#syncPicks {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.pickChip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 260px;
+  padding: 12px 18px;
+  background: #1a1a1a;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 20px;
+  color: #e8eaf0;
+  font-family: sans-serif;
+  font-size: 14px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.pickChip:hover {
+  background: #222222;
+  border-color: #2dee06;
+}
+
+.pickChip.filled {
+  border-color: rgba(45, 238, 6, 0.6);
+}
+
+.pickChip img {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  object-fit: cover;
+}
+
+.pickChip .thumbStrip {
+  display: flex;
+  gap: 4px;
+}
+
+.pickChip .thumbStrip img + img {
+  margin-left: -18px;
+}
+
+.pickChip .chipText {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.pickChip .chipTitle {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.pickChip .chipSub {
+  color: #8a8f98;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.syncCreateBtn {
+  margin-top: 22px;
+  padding: 12px 34px;
+  border: none;
+  border-radius: 20px;
+  background: #2dee06;
+  color: #061206;
+  font-family: sans-serif;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.1s ease, opacity 0.15s;
+}
+
+.syncCreateBtn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.syncCreateBtn:not(:disabled):active {
+  transform: scale(0.95);
+}
+
 .promptrText {
   position: absolute; /* take it out of flex flow */
   top: 20px; /* distance from top */

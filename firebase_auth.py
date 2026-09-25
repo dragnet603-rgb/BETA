@@ -75,13 +75,10 @@ FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 AUTH_ENABLED = bool(FIREBASE_PROJECT_ID)
 
 # LOGIN IS OPEN: every visitor can use the app without signing in (a
-# guest session is handed out automatically in require_login()). The
-# actual Firebase sign-in flow is restricted to this single email -
-# the app owner - who still needs it for the /admin stats page.
-# Override with the ALLOWED_LOGIN_EMAIL env var.
-ALLOWED_LOGIN_EMAIL = os.getenv(
-    "ALLOWED_LOGIN_EMAIL", "temiolajide108@gmail.com"
-).strip().lower()
+# guest session is handed out automatically in require_login()), and
+# any visitor may also sign in (Google or email+password) to get a
+# persistent, personalized session. The /admin stats page stays
+# private: it is gated by stats.is_admin() (ADMIN_EMAIL), not here.
 
 # Routes reachable without a session. /static is also exempt
 # (Flask serves it directly), which keeps JS/CSS/images public;
@@ -157,11 +154,14 @@ def require_login():
 
     Every visitor automatically gets a guest session so stats logging
     still works (guest events are grouped under the "guest" uid).
-    Only the owner can still sign in via /login (needed for the
-    /admin stats page); that restriction is enforced in
-    create_session() below.
+    Public paths (/login, /api/auth/session, /logout, /healthz, /static)
+    are skipped: stamping a guest uid on /login made login_page() treat
+    the visitor as already signed in and bounce them back to the app,
+    so the sign-in form was unreachable. Anyone may sign in (Google or
+    email+password) for a persistent session; /admin stays private via
+    stats.is_admin() (ADMIN_EMAIL).
     """
-    if not session.get("uid"):
+    if not session.get("uid") and not _is_public(request.path):
         session["uid"] = "guest"
         session.setdefault("email", "")
         session.permanent = True
@@ -170,7 +170,12 @@ def require_login():
 
 @auth_bp.route("/login")
 def login_page():
-    if session.get("uid"):
+    # "guest" is the anonymous uid require_login() hands out on app
+    # pages; only a real (Firebase) uid means the visitor is signed in.
+    # Showing the form to guests lets anyone who signed out - or who
+    # was auto-guested while browsing - reach the sign-in page.
+    uid = session.get("uid")
+    if uid and uid != "guest":
         return redirect(url_for("index"))
     return render_template_login()
 
@@ -201,11 +206,9 @@ def create_session():
     except Exception as exc:
         return jsonify(error=f"Invalid token: {exc}"), 401
 
-    # Only the owner may sign in (needed for the /admin stats page);
-    # everyone else just uses the app anonymously via the guest session.
+    # Sign-in is open to everyone. The /admin stats page stays private
+    # via stats.is_admin() (ADMIN_EMAIL) - checked in /admin and /api/me.
     email = (decoded.get("email") or "").strip().lower()
-    if ALLOWED_LOGIN_EMAIL and email != ALLOWED_LOGIN_EMAIL:
-        return jsonify(error="Sign-in is restricted to the app owner."), 403
 
     session.clear()
     # Firebase ID tokens carry the user id in "sub" (and "user_id"),

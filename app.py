@@ -32,6 +32,8 @@ except ImportError as _bce:
     _BANNER_CLEANER_OK = False
 
 import modal_ffmpeg_client  # noqa: E402  (cloud-GPU export proxy + local fallback)
+import sync_pipeline  # noqa: E402  (images + voiceover -> synced video jobs)
+import beat_planner  # noqa: E402  (offline voiceover -> visual beat plan)
 
 
 # ============================================================
@@ -63,10 +65,32 @@ app.config["OUTPUT_FOLDER"] = str(OUTPUT_FOLDER)
 app.config["PROMPTS_FOLDER"] = str(PROMPTS_FOLDER)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 
+# Transcription engine warm-up: prod runs under gunicorn (no __main__),
+# so the Whisper model is preloaded on the first request instead — the
+# app is live by then and the one-time model load happens off the
+# request path in a background thread.
+_APP_WARMED = False
+
+
+@app.before_request
+def _warm_engines_once():
+    global _APP_WARMED
+    if not _APP_WARMED:
+        _APP_WARMED = True
+        sync_pipeline.warm_whisper()
+
 # Static assets (JS/CSS/images/videos) get immutable-style caching.
 # Templates reference them via static_v() which appends an mtime-based
 # ?v=... query so every deploy busts the cache automatically.
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 31536000
+
+# Templates auto-reload even with debug off: without this, template edits
+# only appear after a server restart (Jinja caches per process), which made
+# "my changes aren't showing" confusion during development. With this on,
+# Flask just re-checks the template file's mtime on each render — cheap,
+# and production behaviour is otherwise unchanged. Python code edits still
+# need a server restart, as always.
+app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 # ------------------------------------------------------------
 # FIREBASE AUTH (email/password + Google + magic links)
@@ -162,6 +186,9 @@ def static_v(filename):
     return url_for("static", filename=filename, v=version)
 
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
+# Sync-job uploads: images for the slideshow + one voiceover audio track.
+SYNC_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif", "bmp"}
+SYNC_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "aac", "ogg", "flac", "webm"}
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -360,6 +387,10 @@ def allowed_file(filename: str) -> bool:
         and "." in filename
         and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
     )
+
+
+def _ext_of(filename: str) -> str:
+    return filename.rsplit(".", 1)[1].lower() if "." in filename else ""
 
 
 def safe_filename(filename: str) -> str:
@@ -908,6 +939,516 @@ def canvas_page(filename):
     )
 
 
+@app.route("/sync/<job_id>")
+def sync_page(job_id):
+    manifest = sync_pipeline.load_manifest(job_id)
+    if not manifest:
+        return "Unknown job.", 404
+    return render_template(
+        "sync.html",
+        job_id=job_id,
+        cloud_export_enabled=modal_ffmpeg_client.modal_configured(),
+    )
+
+
+# ============================================================
+# SYNC JOB UPLOAD  (N images + 1 voiceover -> auto-synced video)
+#
+# Either side is optional, but not both:
+#   images + audio  -> transcribe now, sync images to speech
+#   images only     -> usable timeline now, voiceover added later
+#   audio only      -> transcribe now, beats suggest images to make;
+#                      the sync timeline resolves when images arrive
+# ============================================================
+
+@app.post("/sync/upload")
+def sync_upload():
+    images = [f for f in request.files.getlist("images") if f and f.filename]
+    audio = request.files.get("audio")
+
+    if not images and not (audio and audio.filename):
+        return jsonify({"error": "No images or voiceover selected."}), 400
+    if len(images) > 100:
+        return jsonify({"error": "Too many images (max 100)."}), 400
+
+    bad = [
+        f.filename for f in images
+        if _ext_of(f.filename) not in SYNC_IMAGE_EXTENSIONS
+    ]
+    if bad:
+        return jsonify({"error": f"Unsupported image type: {', '.join(bad[:3])}"}), 400
+
+    # The voiceover is OPTIONAL when images exist — the user adds it on the
+    # sync page (audio track in the timeline), CapCut-style. Images are
+    # OPTIONAL when a voiceover exists — the creator makes them after the
+    # beats suggest how many the narration wants.
+    audio_name = None
+    if audio and audio.filename:
+        if _ext_of(audio.filename) not in SYNC_AUDIO_EXTENSIONS:
+            return jsonify({"error": "Unsupported audio type."}), 400
+
+    job_id = uuid.uuid4().hex[:12]
+    folder = sync_pipeline.job_dir(job_id)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    saved = []
+    try:
+        for i, img in enumerate(images, start=1):
+            name = f"img_{i:03d}.{_ext_of(img.filename)}"
+            img.save(folder / name)
+            saved.append(name)
+
+        if audio and audio.filename:
+            audio_name = f"audio.{_ext_of(audio.filename)}"
+            audio.save(folder / audio_name)
+    except OSError as exc:
+        shutil.rmtree(folder, ignore_errors=True)
+        return jsonify({"error": f"Could not store upload: {exc}"}), 500
+
+    has_audio = bool(audio_name)
+    # The same picture uploaded twice cannot cut to itself, so the video
+    # silently holds that image across those beats and looks out of sync.
+    # Detect it at upload time and say so, instead of letting the creator
+    # discover it in the finished MP4.
+    image_warning = sync_pipeline.duplicate_image_warning(
+        sync_pipeline.find_duplicate_images(folder, saved), len(saved)
+    )
+    sync_pipeline.save_manifest(job_id, {
+        "job_id": job_id,
+        "images": saved,
+        "audio": audio_name,
+        "audio_name": audio.filename if has_audio else None,
+        "status": "transcribing" if has_audio else "awaiting_audio",
+        "image_warning": image_warning,
+    })
+    if has_audio:
+        sync_pipeline.start_transcription_job(job_id)
+
+    _stats.log_event(
+        session.get("email", ""), session.get("uid", ""),
+        "sync_upload",
+        f"{len(saved)} images" + (f" + {audio_name}" if audio_name else ""),
+    )
+
+    return jsonify({"status": "complete", "job_id": job_id,
+                    "image_count": len(saved),
+                    "awaiting_audio": not has_audio,
+                    "image_warning": image_warning})
+
+
+@app.post("/sync/images/<job_id>")
+def sync_add_images(job_id):
+    """Append images to an existing sync job (from the preview toolbar)."""
+    manifest = sync_pipeline.load_manifest(job_id)
+    if not manifest:
+        return jsonify({"error": "Unknown job."}), 404
+
+    images = [f for f in request.files.getlist("images") if f and f.filename]
+    if not images:
+        return jsonify({"error": "No images selected."}), 400
+    if len(images) > 100:
+        return jsonify({"error": "Too many images at once (max 100)."}), 400
+
+    bad = [
+        f.filename for f in images
+        if _ext_of(f.filename) not in SYNC_IMAGE_EXTENSIONS
+    ]
+    if bad:
+        return jsonify({"error": f"Unsupported image type: {', '.join(bad[:3])}"}), 400
+
+    existing = manifest.get("images") or []
+    if len(existing) + len(images) > 100:
+        return jsonify({"error": "Too many images in this job (max 100)."}), 400
+
+    # Continue the img_NNN numbering from the highest existing index.
+    start = 0
+    for name in existing:
+        try:
+            start = max(start, int(name.split("_")[1].split(".")[0]))
+        except (IndexError, ValueError):
+            continue
+
+    folder = sync_pipeline.job_dir(job_id)
+    saved = []
+    try:
+        for i, img in enumerate(images, start=start + 1):
+            name = f"img_{i:03d}.{_ext_of(img.filename)}"
+            img.save(folder / name)
+            saved.append(name)
+    except OSError as exc:
+        for name in saved:
+            (folder / name).unlink(missing_ok=True)
+        return jsonify({"error": f"Could not store upload: {exc}"}), 500
+
+    manifest["images"] = existing + saved
+    # Fresh duplicates can appear when the same picture is uploaded again
+    # later; keep the warning in step with the stored files.
+    manifest["image_warning"] = sync_pipeline.duplicate_image_warning(
+        sync_pipeline.find_duplicate_images(folder, manifest["images"]),
+        len(manifest["images"]),
+    )
+
+    # Audio-first flow: the voiceover was transcribed while there were no
+    # images to time. The saved transcript/words are enough to resolve the
+    # sync the moment images arrive — no second Whisper run.
+    if manifest.get("audio") and manifest.get("status") == "ready":
+        audio_file = folder / manifest["audio"]
+        try:
+            (manifest["segments"],
+             manifest["matched"],
+             manifest["sync_warning"]) = sync_pipeline.resolve_visual_segments(
+                manifest.get("words") or [],
+                manifest.get("segments_with_text") or [],
+                len(manifest["images"]),
+                sync_pipeline.get_media_duration(audio_file),
+            )
+            # Keep the preview clips mirroring the fresh segments (the
+            # client rebuilds from segments, but the manifest must not
+            # hold a stale clip layout the next save could misread).
+            manifest["clips"] = sync_pipeline.clips_from_segments(
+                manifest["segments"]
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced, non-fatal
+            return jsonify({
+                "error": f"Could not sync the new images: {exc}"
+            }), 500
+
+    sync_pipeline.save_manifest(job_id, manifest)
+
+    _stats.log_event(
+        session.get("email", ""), session.get("uid", ""),
+        "sync_add_images",
+        f"{len(saved)} images -> {job_id}",
+    )
+
+    return jsonify({
+        "status": "complete",
+        "added": len(saved),
+        "images": manifest["images"],
+        "image_urls": [f"/static/uploads/{job_id}/{n}" for n in saved],
+        "segments": manifest.get("segments") or [],
+        "matched": manifest.get("matched"),
+        "warning": manifest.get("sync_warning"),
+        "image_warning": sync_pipeline.manifest_image_warning(
+            manifest, job_id
+        ),
+    })
+
+
+@app.post("/sync/audio/<job_id>")
+def sync_audio(job_id):
+    """Attach the voiceover to a job that was created images-only."""
+    manifest = sync_pipeline.load_manifest(job_id)
+    if not manifest:
+        return jsonify({"error": "Unknown job."}), 404
+    if manifest.get("status") != "awaiting_audio":
+        return jsonify({"error": "This job already has audio."}), 409
+
+    audio = request.files.get("audio")
+    if not audio or not audio.filename:
+        return jsonify({"error": "No audio file selected."}), 400
+    if _ext_of(audio.filename) not in SYNC_AUDIO_EXTENSIONS:
+        return jsonify({"error": "Unsupported audio type."}), 400
+
+    audio_name = f"audio.{_ext_of(audio.filename)}"
+    try:
+        audio.save(sync_pipeline.job_dir(job_id) / audio_name)
+    except OSError as exc:
+        return jsonify({"error": f"Could not store audio: {exc}"}), 500
+
+    manifest["audio"] = audio_name
+    manifest["audio_name"] = audio.filename
+    manifest["status"] = "transcribing"
+    sync_pipeline.save_manifest(job_id, manifest)
+    sync_pipeline.start_transcription_job(job_id)
+
+    _stats.log_event(
+        session.get("email", ""), session.get("uid", ""),
+        "sync_audio_added", audio_name,
+    )
+    return jsonify({"status": "transcribing"})
+
+
+@app.get("/sync/status/<job_id>")
+def sync_status(job_id):
+    manifest = sync_pipeline.load_manifest(job_id)
+    if not manifest:
+        return jsonify({"error": "Unknown job."}), 404
+
+    response = {
+        "status": manifest.get("status", "unknown"),
+        "matched": manifest.get("matched"),
+        "error": manifest.get("error"),
+        "warning": manifest.get("sync_warning"),
+        "image_count": len(manifest.get("images", [])),
+        "image_warning": sync_pipeline.manifest_image_warning(
+            manifest, job_id
+        ),
+        "segments": manifest.get("segments") or [],
+        "clips": manifest.get("clips") or [],
+        "prompts": manifest.get("prompts") or "",
+        "audio_url": None,
+        "audio_name": manifest.get("audio_name"),
+        "image_urls": [
+            f"/static/uploads/{job_id}/{name}"
+            for name in manifest.get("images", [])
+        ],
+    }
+    audio_name = manifest.get("audio")
+    response["has_audio"] = bool(audio_name)
+    if audio_name:
+        response["audio_url"] = f"/static/uploads/{job_id}/{audio_name}"
+    return jsonify(response)
+
+
+@app.post("/sync/update/<job_id>")
+def sync_update(job_id):
+    """Persist user timeline fixes (merge/split/reorder) from the client."""
+    manifest = sync_pipeline.load_manifest(job_id)
+    if not manifest:
+        return jsonify({"error": "Unknown job."}), 404
+
+    data = request.get_json(silent=True) or {}
+    segments = data.get("segments")
+    clips = data.get("clips")
+    image_count = len(manifest.get("images", []))
+
+    has_clips = isinstance(clips, list) and bool(clips)
+    has_segments = isinstance(segments, list) and bool(segments)
+    # A prompts-only payload is valid: with zero images there is no
+    # timeline yet, only the script to store for later.
+    if not has_clips and not has_segments and "prompts" not in data:
+        return jsonify({"error": "Invalid timeline payload."}), 400
+
+    # Timeline payload: the client's CLIP layout is the editable source
+    # of truth (drag / resize / script retime all edit clips). The
+    # authoritative visual SEGMENTS are derived from it whenever the
+    # layout actually changed, so the preview (clips) and the rendered
+    # video (segments) can never disagree. Skipped when nothing moved,
+    # which also keeps routine saves ffprobe-free.
+    if has_clips:
+        cleaned = []
+        for clip in clips:
+            try:
+                idx = int(clip["image"])
+                dur = float(clip.get("duration"))
+            except (KeyError, TypeError, ValueError):
+                return jsonify({"error": "Invalid clip payload."}), 400
+            if not 0 <= idx < image_count:
+                return jsonify({"error": "Clip references a missing image."}), 400
+            dur = max(
+                sync_pipeline.MIN_CLIP_SECONDS,
+                min(sync_pipeline.MAX_CLIP_SECONDS, dur),
+            )
+            cleaned.append({"image": idx, "duration": round(dur, 3)})
+
+        def _clip_key(c):
+            return (c["image"], c["duration"])
+
+        try:
+            previous = [
+                (int(c.get("image")),
+                 round(float(c.get("duration") or 0), 3))
+                for c in (manifest.get("clips") or [])
+            ]
+        except (TypeError, ValueError, AttributeError):
+            previous = []  # unreadable old layout -> force a re-derive
+        changed = previous != [_clip_key(c) for c in cleaned]
+        manifest["clips"] = cleaned
+
+        audio_name = manifest.get("audio")
+        if (changed and audio_name and image_count
+                and len(cleaned) == image_count):
+            audio_file = sync_pipeline.job_dir(job_id) / audio_name
+            if audio_file.exists():
+                audio_duration = sync_pipeline.get_media_duration(audio_file)
+                if audio_duration and audio_duration > 0:
+                    manifest["segments"] = sync_pipeline.segments_from_clips(
+                        cleaned, audio_duration
+                    )
+                    assigned = [
+                        s.get("image") for s in manifest["segments"]
+                    ]
+                    manifest["matched"] = (
+                        len(assigned) == image_count
+                        and len(set(assigned)) == image_count
+                    )
+    elif has_segments:
+        # Legacy payload without a clip layout (old API callers): keep
+        # the original validation so segments can still be posted alone.
+        for seg in segments:
+            try:
+                if float(seg["end"]) <= float(seg["start"]):
+                    return jsonify(
+                        {"error": "Segment end must be after start."}
+                    ), 400
+            except (KeyError, TypeError, ValueError):
+                return jsonify({"error": "Invalid segment payload."}), 400
+
+        assigned = [s.get("image") for s in segments]
+        valid = all(
+            idx is None or (isinstance(idx, int) and 0 <= idx < image_count)
+            for idx in assigned
+        )
+        if not valid:
+            return jsonify({"error": "Segment references a missing image."}), 400
+
+        manifest["segments"] = segments
+        manifest["matched"] = (
+            all(idx is not None for idx in assigned)
+            and len({i for i in assigned if i is not None}) == image_count
+        )
+        manifest["status"] = "ready"
+
+    # Raw timestamped script from the Add-prompt modal: stored verbatim
+    # (capped) so the creator's text survives reloads. Accepted with or
+    # without timeline changes in the same payload.
+    if "prompts" in data:
+        raw_prompts = data.get("prompts")
+        if raw_prompts is not None and not isinstance(raw_prompts, str):
+            return jsonify({"error": "Invalid prompts payload."}), 400
+        manifest["prompts"] = (raw_prompts or "")[:10000]
+
+    sync_pipeline.save_manifest(job_id, manifest)
+    return jsonify({
+        "status": "saved",
+        "matched": manifest.get("matched"),
+        "clip_count": len(manifest.get("clips") or []),
+    })
+
+
+# ============================================================
+# VISUAL BEAT PLANNING  (voiceover -> suggested image count + beats)
+#
+# Purely advisory: helps the creator decide HOW MANY images to make and
+# what each visual moment is about before they create/upload anything.
+# The suggestions are derived offline from the Whisper transcript — no
+# LLM, no extra API — and are NOT mandatory prompts: the creator can
+# ignore them entirely, make their own images in any tool, and the
+# existing sync engine still maps image 1 -> segment 1, etc.
+# ============================================================
+
+@app.get("/sync/beats/<job_id>")
+def sync_beats(job_id):
+    """Structured beat plan for a transcribed (or transcribable) job."""
+    manifest = sync_pipeline.load_manifest(job_id)
+    if not manifest:
+        return jsonify({"error": "Unknown job."}), 404
+
+    audio_name = manifest.get("audio")
+    if not audio_name:
+        return jsonify({"error": "Add a voiceover first."}), 409
+
+    # Serve the cached plan when it came from the current planner. The
+    # cache exists to avoid re-transcribing, not to freeze old output, so
+    # a plan from an older planner version is recomputed (milliseconds -
+    # the transcript is already persisted).
+    cached = manifest.get("beats")
+    if cached and manifest.get("beats_version") == beat_planner.PLAN_VERSION:
+        return jsonify({
+            "image_count": cached.get("image_count"),
+            "beats": cached.get("beats", []),
+        })
+
+    audio_file = sync_pipeline.job_dir(job_id) / audio_name
+    audio_duration = sync_pipeline.get_media_duration(audio_file)
+
+    transcript = None
+    segments = manifest.get("segments_with_text") or []
+
+    if segments:
+        # The sync pipeline (or an earlier call to this route) already
+        # persisted Whisper's text-bearing segments - reuse them, so the
+        # advisory plan never triggers a second transcription.
+        transcript = (segments, manifest.get("words") or [])
+    else:
+        # Older jobs store segment/word TIMINGS without TEXT: that is all
+        # the sync engine needs, but not enough to describe visual beats.
+        # Re-run the existing offline transcription once and cache the
+        # result below, so this cost is paid once per job.
+        try:
+            segments, words = sync_pipeline.transcribe(
+                sync_pipeline._prepare_transcription_source(audio_file)
+            )
+            transcript = (segments, words)
+        except Exception as exc:  # noqa: BLE001 - surfaced, non-fatal
+            return jsonify({
+                "error": f"Could not transcribe the voiceover: {exc}"
+            }), 502
+
+    try:
+        plan = beat_planner.plan_beats(transcript, audio_duration)
+    except Exception as exc:  # noqa: BLE001 - surfaced, non-fatal
+        return jsonify({"error": f"Beat planning failed: {exc}"}), 500
+
+    # Cache both the plan and the sentence-bearing transcript so later
+    # requests (and page reloads) are instant.
+    manifest["beats"] = plan
+    manifest["beats_version"] = beat_planner.PLAN_VERSION
+    manifest["segments_with_text"] = transcript[0]
+    sync_pipeline.save_manifest(job_id, manifest)
+
+    return jsonify(plan)
+
+
+# ============================================================
+# SYNC RENDER
+#
+# Renders a fully matched sync job into a single 16:9 MP4. Reuses the
+# shared export-job store (_export_jobs), the /export/status/<job_id>
+# polling endpoint and the /download/<filename> route unchanged, plus
+# the _FFMPEG_SLOTS semaphore so a big slideshow render can never OOM
+# the small server box alongside a canvas export.
+# ============================================================
+
+@app.post("/sync/render/<job_id>")
+def sync_render(job_id):
+    manifest = sync_pipeline.load_manifest(job_id)
+    if not manifest:
+        return jsonify({"error": "Unknown job."}), 404
+
+    output_filename = f"sync_{job_id}.mp4"
+    output_path = OUTPUT_FOLDER / output_filename
+
+    try:
+        command, total = sync_pipeline.build_render_command(job_id, output_path)
+    except (RuntimeError, FileNotFoundError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    _prune_export_jobs()
+
+    # Refuse politely instead of risking an OOM kill when an encode is
+    # already running on a small server.
+    if not _FFMPEG_SLOTS.acquire(blocking=False):
+        return jsonify({
+            "error": "Server is busy rendering another video. "
+                     "Please retry in a moment.",
+        }), 503
+
+    export_job_id = _create_export_job()
+
+    def _sync_worker():
+        try:
+            _run_ffmpeg_export(
+                export_job_id, command, output_filename,
+                expected_duration=total,
+            )
+        finally:
+            _FFMPEG_SLOTS.release()
+
+    threading.Thread(target=_sync_worker, daemon=True).start()
+    _stats.log_event(
+        session.get("email", ""), session.get("uid", ""),
+        "sync_render", job_id,
+    )
+
+    return jsonify({
+        "status": "started",
+        "job_id": export_job_id,
+        "output_file": output_filename,
+    })
+
+
 # ============================================================
 # NORMAL UPLOAD
 # ============================================================
@@ -1139,7 +1680,7 @@ def _band_banner_actions(band, text, color=None):
                 "y": band["y0"],
                 "width": 1.0,
                 "height": band["y1"] - band["y0"],
-                "height_px": int(round((band["y1"] - band["y0"]) * 1920)),
+                "height_px": int(round((band["y1"] - band["y0"]) * 1080)),
                 "backgroundColor": "transparent",
             },
         },
@@ -2604,11 +3145,11 @@ def edit_video(filename):
         )
 
         # Output-space geometry sent by the browser (measured by Konva in the
-        # preview). The preview measures text at the 1080-wide OUTPUT
+        # preview). The preview measures text at the 1920-wide OUTPUT
         # resolution, so convert to the source-resolution filter space here.
         out_fs = safe_float(item.get("font_size_out"), 0)
         if out_fs > 0:
-            requested_fs = max(6, int(out_fs * effective_w / 1080.0))
+            requested_fs = max(6, int(out_fs * effective_w / 1920.0))
 
         padding = max(
             4,
@@ -2701,7 +3242,7 @@ def edit_video(filename):
         # letterbox-proof: multiplying by effective_h (the cropped frame
         # height) yields exactly the same banner-to-picture proportion the
         # preview shows, even when the picture doesn't span the full
-        # 1080x1920 output frame.
+        # 1920x1080 output frame.
         height_frac = safe_float(item.get("height_frac"), 0.0)
         if 0.0 < height_frac <= 1.0:
             banner_h = max(
@@ -2716,7 +3257,7 @@ def edit_video(filename):
                 banner_h = max(
                     2,
                     min(
-                        int(exact_out_h * effective_h / 1920.0),
+                        int(exact_out_h * effective_h / 1080.0),
                         max(1, effective_h),
                     ),
                 )
@@ -2936,7 +3477,7 @@ def edit_video(filename):
         out_fs = safe_float(item.get("font_size_out"), 0)
         if out_fs > 0:
             # Exact font size measured in the preview (output px).
-            font_size = max(6, int(out_fs * effective_w / 1080.0))
+            font_size = max(6, int(out_fs * effective_w / 1920.0))
         else:
             font_size = max(
                 10,
@@ -3085,9 +3626,9 @@ def edit_video(filename):
         )
 
     # --------------------------------------------------------
-    # Fixed 9:16 output frame (UNCONDITIONAL, FIT MODE)
+    # Fixed 16:9 output frame (UNCONDITIONAL, FIT MODE)
     #
-    # Every export must come back 1080x1920 regardless of what the
+    # Every export must come back 1920x1080 regardless of what the
     # client sends. The picture is ALWAYS FULLY VISIBLE: scaled to FIT
     # inside the frame and centered — mismatched aspect ratios are
     # letterboxed/pillarboxed with bars filled by the scene background
@@ -3106,9 +3647,9 @@ def edit_video(filename):
         first_defined(
             canvas_resize.get("aspect_ratio"),
             canvas_resize.get("ratio"),
-            "9:16",
+            "16:9",
         )
-    ).lower() if canvas_resize else "9:16"
+    ).lower() if canvas_resize else "16:9"
 
     # Scene background color fills the letterbox bars.
     bg_edit = next(
@@ -3125,13 +3666,13 @@ def edit_video(filename):
     )
 
     if requested_ratio not in {"original", "source", "passthrough"}:
-        vf_parts.append("scale=1080:1920:force_original_aspect_ratio=decrease")
+        vf_parts.append("scale=1920:1080:force_original_aspect_ratio=decrease")
         vf_parts.append(
-            f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color={pad_color}"
+            f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color={pad_color}"
         )
         # Normalize the sample aspect ratio so the final MP4's DISPLAY
-        # aspect ratio is also exactly 9:16 (anamorphic sources otherwise
-        # yield 1080x1920 pixels with a distorted DAR).
+        # aspect ratio is also exactly 16:9 (anamorphic sources otherwise
+        # yield 1920x1080 pixels with a distorted DAR).
         vf_parts.append("setsar=1")
 
     # --------------------------------------------------------
@@ -3318,6 +3859,24 @@ def _run_ffmpeg_export(job_id, command, output_filename, expected_duration=0.0, 
             text=True,
         )
 
+        # Watchdog: a hung encode (e.g. the machine ran out of commit
+        # memory mid-render) must never hold the single ffmpeg slot
+        # forever - that is what produced endless "Server is busy
+        # rendering another video" replies.
+        timeout_s = max(60, int(os.environ.get("FFMPEG_RENDER_TIMEOUT", "900")))
+        timed_out = []
+
+        def _kill_ffmpeg():
+            timed_out.append(True)
+            try:
+                process.kill()
+            except Exception:  # noqa: BLE001 - may have just exited
+                pass
+
+        watchdog = threading.Timer(timeout_s, _kill_ffmpeg)
+        watchdog.daemon = True
+        watchdog.start()
+
         last_progress = 0.0
 
         for line in process.stdout:
@@ -3344,17 +3903,25 @@ def _run_ffmpeg_export(job_id, command, output_filename, expected_duration=0.0, 
             except ValueError:
                 continue
 
+        watchdog.cancel()
         process.wait()
 
         stderr_file.seek(0)
         stderr_text = stderr_file.read()[-12000:]
 
         if process.returncode != 0:
-            print("[Autoquence] Export failed:", stderr_text)
+            if timed_out:
+                message = (
+                    f"FFmpeg render timed out after {timeout_s // 60} minutes "
+                    "and was stopped."
+                )
+            else:
+                message = f"FFmpeg failed: {stderr_text}"
+            print("[Autoquence] Export failed:", message)
             _update_export_job(
                 job_id,
                 status="error",
-                error=f"FFmpeg failed: {stderr_text}",
+                error=message,
             )
             return
 
@@ -3571,6 +4138,12 @@ if __name__ == "__main__":
     print("Export endpoint: POST /edit-video/<filename>")
     print("EXPORT MODE: forced 9:16 (1080x1920) on every export")
     print("=" * 60)
+
+    # Pre-load the Whisper model in the background so the first sync user
+    # of a fresh process doesn't wait for the model load inside their
+    # upload request. (Gunicorn imports app:app without running __main__,
+    # so prod deployments warm up via the WSGI hook below.)
+    sync_pipeline.warm_whisper()
 
     app.run(
         host="0.0.0.0",
