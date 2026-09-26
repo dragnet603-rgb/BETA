@@ -1,17 +1,26 @@
 """Tests for the two bugs behind "10 images but the video looks out of
 sync": duplicate uploads that cannot cut, and render cuts quantized onto
-a coarse frame grid.
+a coarse frame grid. Also locks the render GRAPH itself: each still is
+decoded and scaled once and then duplicated to an exact frame count, the
+encoder thread count follows the deployment env, and the legacy per-frame
+graph stays reachable behind SYNC_RENDER_LEGACY_GRAPH.
 
 Run:  python -m unittest test_sync_render -v
 """
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import sync_pipeline
 from sync_pipeline import (
+    _frame_counts,
     _frame_durations,
+    _render_filter_threads,
     _render_fps,
+    _render_threads,
     duplicate_image_warning,
     find_duplicate_images,
 )
@@ -116,6 +125,184 @@ class TestFrameGrid(unittest.TestCase):
     def test_total_length_is_preserved(self):
         durs = [3.0, 3.0, 3.0]
         self.assertAlmostEqual(sum(_frame_durations(durs, 30)), 9.0, places=6)
+
+
+class TestFrameCounts(unittest.TestCase):
+    """The render graph consumes whole frames, not floating-point seconds."""
+
+    DURS = [4.28, 3.86, 6.36, 5.2, 5.76, 2.62, 7.12, 7.62, 5.5, 4.78]
+
+    def test_counts_are_whole_frames_on_the_grid(self):
+        counts = _frame_counts(self.DURS, 30)
+        self.assertEqual(len(counts), len(self.DURS))
+        for c in counts:
+            self.assertIsInstance(c, int)
+            self.assertGreaterEqual(c, 1)
+
+    def test_cumulative_cuts_stay_within_half_a_frame(self):
+        counts = _frame_counts(self.DURS, 30)
+        fps = 30
+        cum_frames = 0
+        target = 0.0
+        for dur, c in zip(self.DURS, counts):
+            cum_frames += c
+            target += dur
+            self.assertLessEqual(
+                abs(cum_frames / fps - target), 0.5 / fps + 1e-9
+            )
+
+    def test_durations_are_the_same_grid_in_seconds(self):
+        self.assertEqual(
+            _frame_durations(self.DURS, 30),
+            [c / 30 for c in _frame_counts(self.DURS, 30)],
+        )
+
+    def test_total_frames_match_the_planned_total(self):
+        # 3 + 3 + 3 seconds at 30 fps is 270 frames, i.e. exactly 9.0s.
+        self.assertEqual(sum(_frame_counts([3.0, 3.0, 3.0], 30)), 270)
+
+    def test_tiny_durations_get_at_least_one_frame(self):
+        counts = _frame_counts([0.01, 0.01], 30)
+        self.assertTrue(all(c >= 1 for c in counts))
+        self.assertEqual(sum(counts), 3)   # 2 x 0.05s floor -> 2 + 1 frames
+
+
+class TestRenderThreads(unittest.TestCase):
+    """Encoder/filter threads are deployment knobs with safe defaults."""
+
+    ENV = ("SYNC_FFMPEG_THREADS", "FFMPEG_THREADS", "SYNC_FFMPEG_FILTER_THREADS")
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in self.ENV}
+        for key in self.ENV:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_default_stays_two(self):
+        # The 512MB-host default must not drift: raising it is opt-in.
+        self.assertEqual(_render_threads(), 2)
+
+    def test_sync_var_wins_over_the_shared_one(self):
+        os.environ["FFMPEG_THREADS"] = "6"
+        os.environ["SYNC_FFMPEG_THREADS"] = "3"
+        self.assertEqual(_render_threads(), 3)
+
+    def test_shared_app_var_is_honoured(self):
+        os.environ["FFMPEG_THREADS"] = "6"
+        self.assertEqual(_render_threads(), 6)
+
+    def test_zero_means_let_x264_decide(self):
+        os.environ["SYNC_FFMPEG_THREADS"] = "0"
+        self.assertEqual(_render_threads(), 0)
+
+    def test_garbage_falls_back_and_huge_values_are_clamped(self):
+        os.environ["SYNC_FFMPEG_THREADS"] = "lots"
+        self.assertEqual(_render_threads(), 2)
+        os.environ["SYNC_FFMPEG_THREADS"] = "999"
+        self.assertEqual(_render_threads(), sync_pipeline._SYNC_THREADS_MAX)
+        os.environ["SYNC_FFMPEG_THREADS"] = ""
+        self.assertEqual(_render_threads(), 2)
+
+    def test_filter_threads_default_and_override(self):
+        self.assertEqual(_render_filter_threads(), 1)
+        os.environ["SYNC_FFMPEG_FILTER_THREADS"] = "4"
+        self.assertEqual(_render_filter_threads(), 4)
+        os.environ["SYNC_FFMPEG_FILTER_THREADS"] = "nope"
+        self.assertEqual(_render_filter_threads(), 1)
+
+
+class TestRenderGraph(unittest.TestCase):
+    """The command builder: one decode+scale per still, exact frame counts."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self._tmp.name)
+        # Contents never matter: the builder only asks whether the file
+        # exists (and _shrink_for_render returns undecodable files as-is).
+        self.images = ["img_001.jpg", "img_002.jpg"]
+        for name in self.images:
+            (self.folder / name).write_bytes(b"not really a jpeg")
+        self.manifest = {
+            "images": self.images,
+            "clips": [
+                {"image": 0, "duration": 3.0},
+                {"image": 1, "duration": 3.0},
+            ],
+            "segments": [],
+            "matched": False,
+            "audio": None,
+            "status": "ready",
+        }
+        self._saved = {
+            k: os.environ.get(k)
+            for k in ("SYNC_RENDER_LEGACY_GRAPH", "SYNC_RENDER_FPS",
+                      "SYNC_FFMPEG_THREADS", "FFMPEG_THREADS")
+        }
+        for key in self._saved:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._tmp.cleanup()
+
+    def _command(self):
+        out = self.folder / "out.mp4"
+        with mock.patch.object(
+            sync_pipeline, "load_manifest", return_value=self.manifest
+        ), mock.patch.object(
+            sync_pipeline, "job_dir", return_value=self.folder
+        ):
+            return sync_pipeline.build_render_command("unit_test", out)
+
+    @staticmethod
+    def _graph(cmd):
+        return cmd[cmd.index("-filter_complex") + 1]
+
+    def test_each_still_is_decoded_and_scaled_once(self):
+        cmd, total = self._command()
+        graph = self._graph(cmd)
+        # No per-frame demuxer looping any more: one read per still.
+        self.assertEqual(cmd.count("-loop"), 0)
+        # Exactly one scale/pad per still, then duplicate + exact trim.
+        self.assertEqual(graph.count("scale=1920:1080"), 2)
+        self.assertEqual(graph.count("loop=loop=-1:size=1:start=0"), 2)
+        self.assertEqual(graph.count("trim=end_frame=90"), 2)   # 3.0s @30fps
+        self.assertEqual(graph.count("setpts=PTS-STARTPTS"), 2)
+        self.assertAlmostEqual(total, 6.0)
+
+    def test_concat_normalises_on_the_render_fps_grid(self):
+        cmd, _ = self._command()
+        self.assertIn("concat=n=2:v=1:a=0,fps=30[vout]", self._graph(cmd))
+        with mock.patch.dict(os.environ, {"SYNC_RENDER_FPS": "12"}):
+            cmd, _ = self._command()
+        graph = self._graph(cmd)
+        self.assertIn("fps=12[vout]", graph)
+        self.assertEqual(graph.count("trim=end_frame=36"), 2)   # 3.0s @12fps
+
+    def test_legacy_graph_is_still_reachable(self):
+        with mock.patch.dict(os.environ, {"SYNC_RENDER_LEGACY_GRAPH": "1"}):
+            cmd, _ = self._command()
+        graph = self._graph(cmd)
+        self.assertEqual(cmd.count("-loop"), 2)          # -loop 1 per input
+        self.assertNotIn("loop=loop=-1", graph)
+        self.assertNotIn("trim=end_frame=", graph)
+
+    def test_threads_flag_follows_the_env(self):
+        cmd, _ = self._command()
+        self.assertEqual(cmd[cmd.index("-threads") + 1], "2")   # default
+        with mock.patch.dict(os.environ, {"SYNC_FFMPEG_THREADS": "5"}):
+            cmd, _ = self._command()
+        self.assertEqual(cmd[cmd.index("-threads") + 1], "5")
 
 
 if __name__ == "__main__":

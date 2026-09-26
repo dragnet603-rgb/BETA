@@ -4152,6 +4152,7 @@ def _run_ffmpeg_export(job_id, command, output_filename, expected_duration=0.0, 
     against a full stderr buffer.
     """
     stderr_file = None
+    started_at = time.monotonic()
 
     try:
         stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
@@ -4236,6 +4237,23 @@ def _run_ffmpeg_export(job_id, command, output_filename, expected_duration=0.0, 
             output_file=output_filename,
         )
         _stats.log_event("", "", "export_completed", output_filename)
+
+        # One line per render with the numbers that actually decide the
+        # tuning knobs (sync_pipeline._render_threads / SYNC_FFMPEG_THREADS):
+        # wall time, realtime factor and the encoder thread count. Without it
+        # "is this host CPU-bound?" was pure guesswork.
+        elapsed = max(0.001, time.monotonic() - started_at)
+        try:
+            threads = command[command.index("-threads") + 1]
+        except (ValueError, IndexError):
+            threads = "?"
+        speed = (expected_duration / elapsed) if expected_duration > 0 else 0.0
+        print(
+            f"[Autoquence] Export finished: {output_filename} in "
+            f"{elapsed:.1f}s"
+            + (f" ({speed:.2f}x realtime of {expected_duration:.1f}s)" if speed else "")
+            + f", threads={threads}"
+        )
 
     except FileNotFoundError:
         _update_export_job(

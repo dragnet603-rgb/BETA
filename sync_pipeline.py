@@ -1164,14 +1164,20 @@ def _render_fps():
     return max(1, min(60, fps))
 
 
-def _frame_durations(durations, fps):
+def _frame_counts(durations, fps):
     """Quantize segment durations onto the fps frame grid WITHOUT drift.
 
-    Each -t is derived from the CUMULATIVE plan time, so the cut after
+    Each count is derived from the CUMULATIVE plan time, so the cut after
     segment k lands within half a frame of its timeline position and
     rounding errors never pile up (the old code let every segment round
     itself independently, which pushed late cuts up to ~0.7s behind the
-    audio by the end of a 10-image slideshow)."""
+    audio by the end of a 10-image slideshow).
+
+    Whole frames (not seconds) are what the render graph consumes: each
+    still is scaled ONCE and then duplicated to exactly this many frames
+    (see build_render_command), so `trim=end_frame=N` is exact where a
+    floating-point -t can land between frames.
+    """
     out = []
     prev_frames = 0
     cum = 0.0
@@ -1179,9 +1185,71 @@ def _frame_durations(durations, fps):
         cum += max(0.05, float(dur))
         target = int(round(cum * fps))
         frames = max(1, target - prev_frames)
-        out.append(frames / fps)
+        out.append(frames)
         prev_frames += frames
     return out
+
+
+def _frame_durations(durations, fps):
+    """The same grid expressed in seconds.
+
+    Still used by the legacy graph, the verification tools and the tests;
+    derived from _frame_counts so the two can never disagree.
+    """
+    return [count / fps for count in _frame_counts(durations, fps)]
+
+
+# Encoder threads for the slideshow render. This was hard-coded to 2 to
+# protect a 512MB host, and 2 stays the DEFAULT: measured on a box with no
+# idle cores, going from 2 to 8 threads gained nothing (3.1s vs 3.5s per 60
+# frames of 1080p), and libx264's per-thread memory grows with resolution.
+# A deployment that really does have spare cores raises it with
+# SYNC_FFMPEG_THREADS - or with the shared FFMPEG_THREADS that app.py
+# already honours for the editor export - so both paths answer to one knob.
+# 0 means "let x264 decide".
+_SYNC_THREADS_DEFAULT = 2
+_SYNC_THREADS_MAX = 32
+
+
+def _render_threads():
+    """libx264 threads for the sync render (see _SYNC_THREADS_DEFAULT)."""
+    for name in ("SYNC_FFMPEG_THREADS", "FFMPEG_THREADS"):
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            continue          # unusable value: fall through to the default
+        return max(0, min(_SYNC_THREADS_MAX, value))
+    return _SYNC_THREADS_DEFAULT
+
+
+def _render_filter_threads():
+    """Threads for the filter graph (-filter_complex_threads).
+
+    Default 1 keeps the single-threaded, low-memory profile the 512MB
+    deployments were tuned for; a host with room to spare raises it with
+    SYNC_FFMPEG_FILTER_THREADS.
+    """
+    try:
+        value = int(os.getenv("SYNC_FFMPEG_FILTER_THREADS", "1"))
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(16, value))
+
+
+def _legacy_graph():
+    """Opt back into the old per-frame `-loop 1 -t` graph (one env var).
+
+    The default graph decodes and scales each still ONCE and duplicates the
+    result with the `loop` filter, which removes 30 still decodes + scales
+    per second per segment. This flag is only a rollback valve if a host
+    ever disagrees with it.
+    """
+    return str(os.getenv("SYNC_RENDER_LEGACY_GRAPH", "")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 def build_render_command(job_id: str, output_path: Path):
@@ -1264,11 +1332,13 @@ def build_render_command(job_id: str, output_path: Path):
     filters = []
     total_weight = 0.0
 
-    # Frame-grid quantization (see _frame_durations): every -t is cut
-    # from the CUMULATIVE timeline so boundary errors stay within half a
-    # frame and never accumulate across the slideshow.
+    # Frame-grid quantization (see _frame_counts): each segment's screen
+    # time is an exact INTEGER number of frames taken from the CUMULATIVE
+    # timeline, so boundary errors stay within half a frame and never
+    # accumulate across the slideshow.
     render_fps = _render_fps()
-    frame_durs = _frame_durations([d for _, d in plan], render_fps)
+    frame_counts = _frame_counts([d for _, d in plan], render_fps)
+    legacy = _legacy_graph()
 
     for i, (idx, dur) in enumerate(plan):
         img_path = _shrink_for_render(folder, images[idx])
@@ -1277,21 +1347,35 @@ def build_render_command(job_id: str, output_path: Path):
         total_weight += dur
 
         command += [
-            "-loop", "1", "-t", f"{frame_durs[i]:.6f}",
-            "-framerate", str(render_fps),
             # Bound this input's read-ahead to a single packet. concat
             # only consumes the ACTIVE input, so without this the image2
             # demuxer runs ahead and queues every remaining still's frames
             # (the reason the source grid used to be capped at 2 fps).
             # One packet per input keeps a 30 fps grid at a few MB.
             "-thread_queue_size", "1",
-            "-i", str(img_path),
+            "-framerate", str(render_fps),
         ]
-        filters.append(
+        if legacy:
+            command += ["-loop", "1", "-t", f"{frame_counts[i] / render_fps:.6f}"]
+        command += ["-i", str(img_path)]
+
+        # Scale + letterbox ONCE per still. The default graph then hands that
+        # single finished frame to the `loop` filter, which duplicates it to
+        # exactly this segment's frame count - so the still is decoded and
+        # scaled once per segment instead of once per output frame (30x/s).
+        base = (
             f"[{i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
             f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,"
-            f"setsar=1,format=yuv420p[v{i}]"
+            f"setsar=1,format=yuv420p"
         )
+        if legacy:
+            filters.append(f"{base}[v{i}]")
+        else:
+            filters.append(
+                f"{base},loop=loop=-1:size=1:start=0,"
+                f"trim=end_frame={frame_counts[i]},"
+                f"setpts=PTS-STARTPTS[v{i}]"
+            )
 
     # The audio input must be declared BEFORE the filter/map options:
     # FFmpeg applies any option that precedes an -i to that input, so a
@@ -1301,16 +1385,19 @@ def build_render_command(job_id: str, output_path: Path):
         command += ["-i", str(audio_path)]
 
     labels = "".join(f"[v{i}]" for i in range(len(plan)))
-    # The source inputs already sit on the render fps grid (see
-    # _render_fps), so concat cuts exactly where the timeline says. The
-    # trailing fps=30 normalises the stream for the encoder. (An earlier
-    # version used 2 fps inputs because concat buffers every
-    # not-yet-active input: that queue is now bounded by
-    # -thread_queue_size 1 per input, which is what makes the fine grid
-    # affordable - unbounded, a 30 fps grid held the whole remaining
-    # timeline x 30 frames x ~3 MB and died with "Cannot allocate
-    # memory".)
-    filters.append(f"{labels}concat=n={len(plan)}:v=1:a=0,fps=30[vout]")
+    # Every source segment already sits on the render fps grid (see
+    # _render_fps / _frame_counts), so concat cuts exactly where the timeline
+    # says. The trailing fps= normalises the stream for the encoder at that
+    # SAME grid - it used to be hard-coded to 30, which silently disagreed
+    # with SYNC_RENDER_FPS on any deployment that lowered it. (An earlier
+    # version used 2 fps inputs because concat buffers every not-yet-active
+    # input: that queue is now bounded by -thread_queue_size 1 per input,
+    # which is what makes the fine grid affordable - unbounded, a 30 fps grid
+    # held the whole remaining timeline x 30 frames x ~3 MB and died with
+    # "Cannot allocate memory".)
+    filters.append(
+        f"{labels}concat=n={len(plan)}:v=1:a=0,fps={render_fps}[vout]"
+    )
 
     # True length of the render: the sum of the per-image screen times,
     # which now includes the pauses (used for progress reporting).
@@ -1318,7 +1405,7 @@ def build_render_command(job_id: str, output_path: Path):
 
     command += [
         "-filter_complex", ";".join(filters),
-        "-filter_complex_threads", "1",
+        "-filter_complex_threads", str(_render_filter_threads()),
         "-map", "[vout]",
     ]
 
@@ -1346,9 +1433,10 @@ def build_render_command(job_id: str, output_path: Path):
         # 11619264 failed" encoder crashes on small-RAM machines (4-core
         # Celeron at ~99% commit charge) even with several GB nominally
         # free. Disabling the lookaheads removes those buffers with no
-        # meaningful quality change at CRF 20; threads stays modest so a
-        # render never starves the rest of the server.
-        "-threads", "2",
+        # meaningful quality change at CRF 20; the thread count defaults to
+        # 2 for the same reason and is raised per deployment (see
+        # _render_threads / SYNC_FFMPEG_THREADS).
+        "-threads", str(_render_threads()),
         "-x264-params", "rc-lookahead=0:sync-lookahead=0",
         "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats",
