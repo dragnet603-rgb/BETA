@@ -72,11 +72,38 @@ body {
 }
 
 /* Preview and timeline share ONE width. The height-aware term converts
-   leftover vertical space into the widest 16:9 box that fits, so the
-   preview shrinks on short screens instead of clipping the panels. */
+   leftover vertical space into the widest box of the CURRENT picture's
+   shape that fits, so the preview shrinks on short screens instead of
+   clipping the panels.
+
+   --preview-ratio is the displayed picture's width/height, written by
+   sync.js from the image's real dimensions (see applyPreviewRatio). A
+   non-16:9 clip therefore gets a canvas of its OWN shape - a portrait
+   photo fills a portrait canvas instead of sitting as a thin strip
+   inside a 16:9 letterbox - and body's align-items keeps it centered.
+   Only the preview changes: the rendered MP4 is always 1920x1080. */
 .sync-canvas {
-  width: max(240px, min(var(--panel-w), calc((100dvh - var(--chrome-h)) * 16 / 9)));
+  --preview-ratio: 1.7778;   /* 16:9 until a picture's real size is known */
+  /* The room the shell can actually give the preview. Everything below is
+     derived from it, so the timeline and the action row below can never be
+     pushed off-screen (body is a fixed 100dvh column with overflow:hidden).
+     The floor keeps the canvas from collapsing to nothing on the tiny
+     landscape phones where that budget is exhausted - those screens scroll
+     instead (see max-height: 500px). */
+  --preview-h: max(160px, calc(100dvh - var(--chrome-h)));
+  /* The box IS the picture's shape: width comes from that shape, so the
+     height follows it and a non-16:9 clip fills the canvas exactly instead
+     of being letterboxed. 16:9 pictures land on the same size they always
+     had. The small floor only matters on the margin where the height cap
+     (max-height below) has already taken over. */
+  width: min(var(--panel-w), max(120px, calc(var(--preview-h) * var(--preview-ratio))));
+  max-height: var(--preview-h);
+  aspect-ratio: var(--preview-ratio);
   margin-bottom: 10px;
+  /* The width term is driven by the ratio, so easing both keeps the box
+     from snapping mid-playback when the shape changes at a cut. */
+  transition: width 0.25s cubic-bezier(0.22, 1, 0.36, 1),
+              aspect-ratio 0.25s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 /* Every panel is capped at the SAME outer width as the preview, so its
@@ -1149,6 +1176,16 @@ body,
   body {
     padding-top: 140px;    /* canvas + play pushed a little lower */
     padding-bottom: 10px; /* buttons end just above the screen edge */
+  }
+
+  /* A tall (portrait / square / 4:3) preview needs that vertical room:
+     the header offset that centers a 16:9 canvas is dead space above a
+     tall one, so it is handed back to the canvas instead of letting the
+     action row clip at the bottom of the fixed shell. sync.js sets the
+     class from the live preview ratio (body.preview-tall), and it is
+     only ever applied on these narrow screens. */
+  body.preview-tall {
+    padding-top: 96px;
   }
 
   #syncTimeline {

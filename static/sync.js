@@ -1108,6 +1108,83 @@
     updatePlayhead();
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // Preview canvas shape
+  //
+  // The canvas is NOT locked to 16:9: it takes the shape of the picture
+  // being previewed, so a non-16:9 upload fills the canvas at its own
+  // ratio (centered) instead of sitting inside a letterbox. ONLY the
+  // preview changes - the rendered MP4 is always 1920x1080
+  // (sync_pipeline.build_render_command).
+  //
+  // The ratio comes from the picture's REAL dimensions, never from a file
+  // name or a guess:
+  //   * images already on the server -> measured from the preview bitmap
+  //     when it loads (covers first paint and every reload);
+  //   * images still uploading -> carried on the File by image-shrink.js
+  //     (previewW / previewH), so the canvas is already right before the
+  //     upload lands.
+  // Unknown / undecodable pictures keep 16:9 - exactly the old look.
+  // ─────────────────────────────────────────────────────────────
+  const DEFAULT_PREVIEW_RATIO = 16 / 9;
+  const PREVIEW_RATIO_MIN = 0.5;   // 1:2  - a photo may get tall, not a strip
+  const PREVIEW_RATIO_MAX = 2.4;   // 12:5 - and wide, not a slit
+  const imageRatios = new Map();   // image URL -> width / height
+  let currentPreviewRatio = DEFAULT_PREVIEW_RATIO;
+
+  /** A picture's width/height, clamped to a shape the layout can show. */
+  function previewRatioOf(w, h) {
+    const ratio = Number(w) / Number(h);
+    if (!Number.isFinite(ratio) || ratio <= 0) return DEFAULT_PREVIEW_RATIO;
+    return clamp(ratio, PREVIEW_RATIO_MIN, PREVIEW_RATIO_MAX);
+  }
+
+  /** Remember a picture's real size so later clips reshape instantly. */
+  function rememberImageRatio(url, w, h) {
+    if (url && w > 0 && h > 0) imageRatios.set(url, previewRatioOf(w, h));
+  }
+
+  /** Write the canvas shape (a no-op when it is already that shape). */
+  function applyPreviewRatio(ratio) {
+    if (!previewBox || !Number.isFinite(ratio) || ratio <= 0) return;
+    if (Math.abs(ratio - currentPreviewRatio) < 0.001) return;
+    currentPreviewRatio = ratio;
+    previewBox.style.setProperty("--preview-ratio", String(ratio));
+    // Anything taller than ~4:3 needs more vertical room than the 16:9
+    // layout was tuned for. On narrow screens the mobile spacing hands
+    // its header offset back to the canvas (see body.preview-tall), which
+    // is what keeps the action row from clipping.
+    document.body.classList.toggle("preview-tall", ratio <= 1.4);
+  }
+
+  /** Index of the clip the big preview is currently held on. */
+  function previewClipIndex() {
+    return pinnedClip >= 0 && pinnedClip < state.clips.length
+      ? pinnedClip
+      : clipAt(currentTime());
+  }
+
+  /** Shape the canvas after one image. A 16:9 image leaves it unchanged. */
+  function applyPreviewRatioFor(imageIndex) {
+    const known = imageRatios.get(state.images[imageIndex]);
+    if (known) applyPreviewRatio(known);
+  }
+
+  // The preview bitmap is the source of truth: its natural size IS the
+  // picture on screen. Measuring it on load covers images that were
+  // already stored on the server (first paint, reload), where the picker
+  // never saw them, and it re-confirms an optimistic ratio from an upload.
+  imgEl?.addEventListener("load", () => {
+    if (!imgEl.naturalWidth || !imgEl.naturalHeight) return;
+    rememberImageRatio(imgEl.src, imgEl.naturalWidth, imgEl.naturalHeight);
+    const idx = previewClipIndex();
+    // Only adopt it while this picture is STILL the one on screen: a fast
+    // playhead may have moved on to another image in the meantime.
+    if (idx >= 0 && String(state.clips[idx].image) === imgEl.dataset.idx) {
+      applyPreviewRatio(imageRatios.get(imgEl.src));
+    }
+  });
+
   function updatePreview() {
     // While dragging or resizing, hold the preview on the clip being
     // edited so shifting a boundary can't flip the big preview mid-gesture.
@@ -1116,6 +1193,11 @@
       : clipAt(currentTime());
     if (idx < 0) return;
     const image = state.clips[idx].image;
+    // The canvas takes THIS clip's shape: a 16:9 picture keeps the 16:9
+    // frame it always had, a non-16:9 one fills the canvas at its own
+    // ratio. Unknown pictures leave the current shape alone until their
+    // bitmap (or the pending upload's dimensions) reports the real size.
+    applyPreviewRatioFor(image);
     if (imgEl.dataset.idx !== String(image)) {
       imgEl.src = state.images[image] || "";
       imgEl.dataset.idx = String(image);
@@ -1265,6 +1347,17 @@
       const prepared = await window.shrinkImagesForUpload(
         files, (file) => showPendingImage(file)
       );
+      // An EMPTY canvas adopts the first picture's shape immediately, so a
+      // non-16:9 upload is never shown inside the 16:9 letterbox it is
+      // about to replace. With images already on the timeline the canvas
+      // keeps following the clip under the playhead instead (see
+      // updatePreview), not the picture that was just picked.
+      if (!state.images.length) {
+        const first = prepared.find((f) => f.previewW && f.previewH);
+        if (first) {
+          applyPreviewRatio(previewRatioOf(first.previewW, first.previewH));
+        }
+      }
       uploadImages(prepared);
     }
   });

@@ -19,7 +19,10 @@
       
     </div>
 
-    <!-- 16:9 preview: shows the image for the current moment -->
+    <!-- Adaptive preview: shows the image for the current moment and takes
+         THAT image's aspect ratio (16:9 by default / for 16:9 pictures),
+         so a non-16:9 upload keeps its own shape on the canvas. The
+         export is unaffected - the MP4 is always 16:9. -->
     <div class="canvas-container sync-canvas">
       <div class="canvas">
         <img id="syncPreviewImg" preload="auto"  alt="" />

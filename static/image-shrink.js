@@ -15,6 +15,11 @@
  * ~320px copy - so the timeline can paint the pictures IMMEDIATELY,
  * before the upload finishes. Callers that ignore it are unaffected.
  *
+ * Each returned File also carries `previewW` / `previewH` (the source
+ * picture's real pixel size, free from the decode above) so the sync page
+ * can shape its preview canvas to a non-16:9 upload before the upload has
+ * even finished (see applyPreviewRatio in sync.js).
+ *
  * Usage: const prepared = await window.shrinkImagesForUpload(files, onProgress);
  * Falls back to the original files when the browser can't decode one
  * (e.g. HEIC) — the server still validates types.
@@ -79,6 +84,12 @@ window.shrinkImagesForUpload = async function shrinkImagesForUpload(
     let bmp = null;
     try {
       bmp = await createImageBitmap(file);
+      // Real pixel size of the picture: the sync preview uses it to give a
+      // non-16:9 image a canvas of its own shape. Attached to the ORIGINAL
+      // File here so every branch below carries it, including the
+      // re-encoded one (which is a brand new File - see drawToBlob call).
+      file.previewW = bmp.width;
+      file.previewH = bmp.height;
       const long = Math.max(bmp.width, bmp.height);
       if (long <= MAX_EDGE && file.size <= PASS_THROUGH_BYTES) {
         // Nothing to gain by re-encoding: the original file IS the
@@ -95,7 +106,12 @@ window.shrinkImagesForUpload = async function shrinkImagesForUpload(
       );
       if (blob && blob.size < file.size) {
         const name = file.name.replace(/\.[^.]+$/, "") + ".jpg";
-        out[index] = new File([blob], name, { type: "image/jpeg" });
+        const shrunkFile = new File([blob], name, { type: "image/jpeg" });
+        // A re-encoded picture is a NEW File object: re-attach the real
+        // dimensions so the canvas shape survives the shrink.
+        shrunkFile.previewW = bmp.width;
+        shrunkFile.previewH = bmp.height;
+        out[index] = shrunkFile;
         shrunk++;
       } else {
         out[index] = file;
