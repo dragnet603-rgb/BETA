@@ -1722,6 +1722,8 @@
   // - Time ranges (00:10 - 00:20, [00:10 -> 00:20], 00:10 to 00:20)
   // - Varied separators (-, –, —, :, |, /, whitespace)
   // - Trailing descriptions (or empty text)
+  // - Block bodies: a stamp with NO text adopts the following line(s)
+  //   (e.g. **[00:00–00:05]** alone on one line, wrapped prose underneath)
   const PROMPT_LINE_RE =
     /^(?:[\s*\-_#=>\u2022\u25E6\u25AA\u25B8]|(?:\d+|[a-zA-Z])[.)\]])*\s*(?:(?:\[([A-Za-z0-9 _\-]+)\]|([A-Za-z]{2,}[A-Za-z0-9 _\-]*?))\s*:|\[([A-Za-z0-9 _\-]+)\]\s*(?=[(\[]|\d)|([A-Za-z]{2,}[A-Za-z0-9 _\-]*?)\s*(?=[(\[]))?\s*[*_\x60~]*(?:\[|\()?\s*(?:(\d{1,3}):)?(\d{1,2}):(\d{1,2}(?:[.,]\d+)?)(?:\s*(?:[-–—~→:]+|->|-->|\bto\b)\s*(?:\d{1,3}:)?\d{1,2}:\d{1,2}(?:[.,]\d+)?)*(?:\s*(?:\]|\)))?[*_\x60~]*(?:(?:[\s\-–—|/.:]+|\s+)(\S.*)|$)/;
 
@@ -1772,10 +1774,18 @@
 
   /** Parse pasted lines -> {prompts, errors}. Blank lines are skipped,
    *  timestamps must strictly increase, and every problem is reported
-   *  with its line number so the whole script can be fixed in one pass. */
+   *  with its line number so the whole script can be fixed in one pass.
+   *
+   *  Block format: a timestamp with NO inline text opens a block whose
+   *  body sits on the following line(s) - "**[00:00–00:05]**" alone on
+   *  one line, wrapped prose underneath, blank lines between blocks.
+   *  While inBody is set, non-timestamp lines JOIN that beat's text
+   *  instead of erroring; a header that already carries inline text
+   *  keeps the strict one-line-per-beat contract (junk still flagged). */
   function parsePromptLines(raw) {
     const prompts = [];
     const errors = [];
+    let inBody = false;
     String(raw || "").split(/\r?\n/).forEach((rawLine, i) => {
       const line = rawLine.trim();
       if (!line) return;
@@ -1783,6 +1793,17 @@
       const plain = line.replace(/[*_`~]/g, "").trim();
       const m = PROMPT_LINE_RE.exec(line) || PROMPT_LINE_RE.exec(plain);
       if (!m) {
+        if (inBody && prompts.length) {
+          // Continuation of the beat above: bullet prefix off, markdown
+          // wrappers off (same cleaner the inline text gets).
+          const body = cleanPromptText(line.replace(/^[-*•]\s+/, ""));
+          if (body) {
+            const prev = prompts[prompts.length - 1];
+            const base = String(prev.text || "").trimEnd();
+            prev.text = base ? `${base} ${body}` : body;
+          }
+          return;
+        }
         errors.push(`Line ${i + 1}: expected "0:00 - description" `
           + `(got "${line.slice(0, 30)}").`);
         return;
@@ -1796,11 +1817,15 @@
       if (start <= prev) {
         errors.push(`Line ${i + 1}: timestamps must go up - each line needs `
           + `a later time than the one above.`);
+        // The rejected beat's body must not glue itself to the beat above.
+        inBody = false;
         return;
       }
       let text = (m[8] || "").trim();
       text = text.replace(/^[-–—|/:\s]+/, "").trim();
       text = cleanPromptText(text);
+      // Header-only stamp: everything up to the next stamp is its body.
+      inBody = !text;
       if (speaker) {
         const speakerPrefix = speaker.trim() + ": ";
         if (!text.startsWith(speakerPrefix)) {

@@ -27,6 +27,7 @@ def load_parser():
 
     def parse_lines(raw):
         prompts, errors = [], []
+        in_body = False
         for i, raw_line in enumerate(str(raw or "").splitlines()):
             line = raw_line.strip()
             if not line:
@@ -34,6 +35,14 @@ def load_parser():
             plain = re.sub(r"[*_`~]", "", line).strip()
             m = re_obj.match(line) or re_obj.match(plain)
             if not m:
+                if in_body and prompts:
+                    # Continuation of the beat above (block format): bullet
+                    # prefix off, markdown wrappers off - mirrors sync.js.
+                    body = clean_text(re.sub(r"^[-*•]\s+", "", line))
+                    if body:
+                        base = str(prompts[-1]["text"] or "").rstrip()
+                        prompts[-1]["text"] = (base + " " + body) if base else body
+                    continue
                 errors.append(f'Line {i+1}: expected "0:00 - description" (got "{line[:30]}").')
                 continue
             speaker = m.group(1) or m.group(2) or m.group(3) or m.group(4) or ""
@@ -42,8 +51,10 @@ def load_parser():
             prev = prompts[-1]["start"] if prompts else -float("inf")
             if start <= prev:
                 errors.append(f"Line {i+1}: timestamps must go up - each line needs a later time than the one above.")
+                in_body = False   # rejected beat's body must not join the beat above
                 continue
             text = clean_text(re.sub(r"^[-–—|/:\s]+", "", m.group(8) or "").strip())
+            in_body = not text   # header-only stamp: next lines are its body
             if speaker:
                 prefix = speaker.strip() + ": "
                 if not text.startswith(prefix):
@@ -121,6 +132,61 @@ class TestPromptParser(unittest.TestCase):
         self.assertEqual(len(res["errors"]), 1)
         self.assertIn('expected "0:00 - description"', res["errors"][0])
         self.assertIn("Line 2", res["errors"][0])
+
+    def test_bracket_range_stamp_with_body_lines(self):
+        # ChatGPT-style export: bold bracketed RANGE stamp alone on its
+        # line, wrapped prose underneath, blank lines between blocks.
+        script = (
+            "**[00:00–00:05]**\n"
+            "Nigeria is more than Africa’s most populous country.\n"
+            "It’s a place where hundreds of cultures, languages, and traditions meet.\n"
+            "\n"
+            "**[00:05–00:10]**\n"
+            "From the busy streets of Lagos to the ancient landscapes of the north,\n"
+            "every region tells a different story.\n"
+            "\n"
+            "**[00:10–00:15]**\n"
+            "Nigeria is home to Nollywood, Afrobeats, and some of Africa’s biggest global stars.\n"
+        )
+        res = self.parser(script)
+        self.assertEqual(res["errors"], [])
+        self.assertEqual([p["start"] for p in res["prompts"]], [0.0, 5.0, 10.0])
+        self.assertEqual(
+            res["prompts"][0]["text"],
+            "Nigeria is more than Africa’s most populous country. "
+            "It’s a place where hundreds of cultures, languages, and traditions meet.",
+        )
+        self.assertEqual(
+            res["prompts"][1]["text"],
+            "From the busy streets of Lagos to the ancient landscapes of the north, "
+            "every region tells a different story.",
+        )
+        self.assertEqual(
+            res["prompts"][2]["text"],
+            "Nigeria is home to Nollywood, Afrobeats, and some of Africa’s biggest global stars.",
+        )
+
+    def test_body_lines_are_cleaned_like_inline_text(self):
+        script = "**[00:00–00:05]**\n**Bold body line**\n- Bullet body line"
+        res = self.parser(script)
+        self.assertEqual(res["errors"], [])
+        self.assertEqual(res["prompts"][0]["text"], "Bold body line Bullet body line")
+
+    def test_block_bodies_do_not_weaken_inline_headers(self):
+        # Continuation only applies to header-only stamps: a line whose
+        # beat already has inline text still has to carry its own stamp.
+        script = "00:00 - Valid beat\nJust some stray prose"
+        res = self.parser(script)
+        self.assertEqual(len(res["errors"]), 1)
+        self.assertIn("Line 2", res["errors"][0])
+
+    def test_rejected_stamp_body_does_not_glue_to_previous_beat(self):
+        script = "00:00 - First\n00:00 - Duplicate\norphan body"
+        res = self.parser(script)
+        self.assertEqual(len(res["errors"]), 2)
+        self.assertIn("Line 2", res["errors"][0])
+        self.assertIn("Line 3", res["errors"][1])
+        self.assertEqual(res["prompts"][0]["text"], "First")
 
 
 if __name__ == "__main__":
