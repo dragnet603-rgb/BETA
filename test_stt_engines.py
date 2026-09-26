@@ -141,6 +141,33 @@ class TestChain(EngineTestBase):
             engine, _s, _w = sync_pipeline.transcribe_with_engine(Path("x.mp3"))
         self.assertEqual(engine, "local")
 
+    def test_engine_failure_logs_console_and_stats(self):
+        # A fallback must never be silent: the console line explains a
+        # "why whisper instead of groq?" support question, and the stats
+        # event keeps the answer after the console is gone.
+        os.environ["GROQ_API_KEY"] = "gsk_test"
+        logged = []
+        with mock.patch.object(sync_pipeline, "_get_groq_client",
+                               lambda: object()), \
+             self.fake("_transcribe_groq",
+                       error=RuntimeError("429 rate limited")), \
+             self.fake("_transcribe_local", (SEGS, WORDS)), \
+             mock.patch.object(sync_pipeline, "_log_transcribe_event",
+                               lambda event, detail: logged.append(
+                                   (event, detail))), \
+             mock.patch("builtins.print") as printer:
+            engine, _s, _w = sync_pipeline.transcribe_with_engine(
+                Path("x.mp3")
+            )
+        self.assertEqual(engine, "local")
+        printed = " ".join(
+            " ".join(str(a) for a in call.args)
+            for call in printer.call_args_list
+        )
+        self.assertIn("groq failed", printed)
+        self.assertIn("429 rate limited", printed)
+        self.assertIn(("engine_fallback", "groq: 429 rate limited"), logged)
+
     def test_openai_is_last(self):
         os.environ["OPENAI_API_KEY"] = "sk-test"
         with self.fake("_transcribe_local", error=ImportError("no faster_whisper")), \
@@ -169,6 +196,28 @@ class TestChain(EngineTestBase):
             segments, words = sync_pipeline.transcribe(Path("x.mp3"))
         self.assertEqual(segments, SEGS)
         self.assertEqual(words, WORDS)
+
+
+class TestJobEngineLabel(EngineTestBase):
+    """The manifest's "via ..." label must describe the CURRENT run."""
+
+    def test_new_run_clears_previous_engine(self):
+        # A re-transcription starts with no engine: keeping the old label
+        # would show "via groq" while the new run may use another engine.
+        manifest = {"audio": "voice.wav", "status": "ready",
+                    "transcript_engine": "groq"}
+        saved = []
+        with mock.patch.object(sync_pipeline, "load_manifest",
+                               return_value=manifest), \
+             mock.patch.object(sync_pipeline, "save_manifest",
+                               lambda job_id, m: saved.append(dict(m))), \
+             mock.patch.object(sync_pipeline, "job_dir",
+                               return_value=Path(tempfile.gettempdir())), \
+             mock.patch.object(sync_pipeline.threading, "Thread",
+                               mock.Mock()):
+            sync_pipeline.start_transcription_job("job_x")
+        self.assertEqual(saved[0]["status"], "processing")
+        self.assertNotIn("transcript_engine", saved[0])
 
 
 class TestLocalEngineSelection(EngineTestBase):

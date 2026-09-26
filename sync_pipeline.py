@@ -411,6 +411,13 @@ def transcribe_with_engine(audio_path: Path):
                 silent = (name, segments, words)
         except Exception as exc:  # noqa: BLE001 - try the next engine
             errors.append(f"{name}: {exc}")
+            # A silent fallback hides WHY the job ran on a different
+            # engine than expected - say so in the console and in
+            # stats.db so a "why whisper?" question is answerable.
+            print(f"[sync] transcribe: {name} failed ({exc}) - "
+                  f"trying the next engine", flush=True)
+            _log_transcribe_event("engine_fallback",
+                                  f"{name}: {str(exc)[:300]}")
     if silent is not None:
         return silent
     detail = "; ".join(errors) or "no transcription engine is configured"
@@ -878,6 +885,10 @@ def start_transcription_job(job_id: str):
     if not manifest:
         raise FileNotFoundError(job_id)
     manifest["status"] = "processing"
+    # Drop the PREVIOUS run's engine label: the page's "via ..." badge
+    # would otherwise claim groq while this run may be served by
+    # another engine (the worker re-records it on success).
+    manifest.pop("transcript_engine", None)
     save_manifest(job_id, manifest)
 
     audio_file = job_dir(job_id) / manifest["audio"]

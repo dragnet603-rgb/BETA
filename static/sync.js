@@ -106,7 +106,7 @@
     prompts: "",   // raw timestamped script persisted in the manifest
     imageWarning: "",  // server note when two uploads are the same picture
     thumbs: [],        // tiny server-made copies for the filmstrip ([] = use images)
-    engine: "",        // which engine transcribed the voiceover (groq/local/openai)
+    engine: "",        // which engine transcribed the voiceover (groq/local/openai/webgpu-tiny.en)
   };
 
   // Waveform peaks cache: recomputed only when the audio URL changes.
@@ -258,16 +258,26 @@
     state.matched = !!data.matched;
     state.sig = sig;
     state.status = typeof data.status === "string" ? data.status : "";
-    // Only overwrite once the server knows an engine: older deployments
-    // simply do not send the field.
-    if (typeof data.transcript_engine === "string" && data.transcript_engine) {
-      state.engine = data.transcript_engine;
+    // The server clears transcript_engine when a NEW run starts (so a
+    // stale "via groq" can't describe a run that hasn't finished), so an
+    // absent value must clear the label - but only when the field is
+    // present at all: older deployments do not send it.
+    if (data.transcript_engine !== undefined) {
+      state.engine = data.transcript_engine || "";
     }
     if (typeof data.prompts === "string") state.prompts = data.prompts;
     // Server-side duplicate-picture note (it owns the stored files, and
     // only it can hash them): "" clears a stale note after a re-upload.
     if (typeof data.image_warning === "string") {
       state.imageWarning = data.image_warning;
+    }
+
+    // First poll that knows the engine: repaint the voiceover chip so
+    // "Transcribed via ..." shows up without a page reload.
+    if (state.status === "ready" && state.engine
+        && engineChipFor !== state.engine) {
+      engineChipFor = state.engine;
+      paintVoiceoverChip(true);
     }
 
     if (!rebuild) return;
@@ -728,6 +738,32 @@
     return state.audioName || "Voiceover";
   }
 
+  // Friendly engine names for the "Transcribed via ..." chip and the
+  // beats popup: raw values are groq/local/openai/webgpu-tiny.en.
+  function engineShort(engine) {
+    const e = String(engine || "").toLowerCase();
+    if (!e) return "";
+    if (e.indexOf("webgpu") !== -1 || e.indexOf("tiny") !== -1
+        || e === "client" || e === "device") return "on-device Whisper";
+    if (e.indexOf("groq") !== -1) return "Groq";
+    if (e.indexOf("openai") !== -1) return "OpenAI";
+    if (e.indexOf("local") !== -1 || e.indexOf("faster") !== -1) {
+      return "server Whisper";
+    }
+    return String(engine);
+  }
+
+  // Sub-line of the voiceover chip, or "" while the transcript (and its
+  // engine) is not known yet.
+  function engineChipSub() {
+    if (state.status !== "ready" || !state.engine) return "";
+    return `Transcribed via ${engineShort(state.engine)}`;
+  }
+
+  // Painted at most once per engine value so status polls don't rebuild
+  // the chip needlessly; set by applyServerData when the engine arrives.
+  let engineChipFor = "";
+
   function paintVoiceoverChip(hasAudio) {
     if (!audioBlock) return;
     if (hasAudio) {
@@ -750,7 +786,9 @@
     audioBlock.innerHTML =
       `<canvas id="syncWaveCanvas" class="waveCanvas"></canvas>`
       // + `<span class="chipTitle">${escapeHtml(label)}${dur != null ? " \u00b7 " + fmt(dur) : ""}</span>`
-      + `<span class="chipSub"></span>`;
+      // chipSub = honest engine label once the transcript is ready:
+      // "Transcribed via Groq" / "… server Whisper" / "… on-device Whisper".
+      + `<span class="chipSub">${escapeHtml(engineChipSub())}</span>`;
     applyAudioWidth();
     drawWave();
     const src = audioEl.getAttribute("src") || audioEl.src || "";
@@ -2118,7 +2156,7 @@
         // "via groq" is the only way a user can tell which engine is
         // actually doing the work - a slow server run looks identical
         // otherwise.
-        const via = state.engine ? ` - via ${state.engine}` : "";
+        const via = state.engine ? ` - via ${engineShort(state.engine)}` : "";
         beatsProgressText.textContent = secs > 90
           ? `Transcribing voiceover… (${secs}s)${via} - a cold start `
             + "after a deploy can take a few minutes"

@@ -1468,6 +1468,9 @@ def sync_client_transcript(job_id):
             "adopted_at": time.time(),
         })
         manifest["client_transcribe"] = marker
+        # This route bypasses the job worker, so record the engine here -
+        # otherwise the "via ..." badge keeps the PREVIOUS run's label.
+        manifest["transcript_engine"] = marker["engine"]
         sync_pipeline.save_manifest(job_id, manifest)
 
     payload = _sync_status_payload(job_id, manifest)
@@ -1658,6 +1661,7 @@ def sync_beats(job_id):
     audio_duration = sync_pipeline.get_media_duration(audio_file)
 
     transcript = None
+    engine = None
     segments = manifest.get("segments_with_text") or []
 
     if segments:
@@ -1671,7 +1675,7 @@ def sync_beats(job_id):
         # Re-run the existing offline transcription once and cache the
         # result below, so this cost is paid once per job.
         try:
-            segments, words = sync_pipeline.transcribe(
+            engine, segments, words = sync_pipeline.transcribe_with_engine(
                 sync_pipeline._prepare_transcription_source(audio_file)
             )
             transcript = (segments, words)
@@ -1690,6 +1694,10 @@ def sync_beats(job_id):
     manifest["beats"] = plan
     manifest["beats_version"] = beat_planner.PLAN_VERSION
     manifest["segments_with_text"] = transcript[0]
+    # Late transcription (older jobs without text): record its engine too,
+    # so the "via ..." badge and the voiceover chip never go stale.
+    if engine:
+        manifest["transcript_engine"] = engine
     sync_pipeline.save_manifest(job_id, manifest)
 
     return jsonify(plan)

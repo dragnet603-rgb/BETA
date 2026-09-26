@@ -7,4 +7,8 @@
 #  - max-requests recycles the worker periodically so slow leaks can't
 #    accumulate on a long-running small box.
 #  - MALLOC_ARENA_MAX=2 curbs glibc heap fragmentation under threads.
-web: MALLOC_ARENA_MAX=2 gunicorn app:app --workers 1 --threads 4 --timeout 300 --max-requests 200 --max-requests-jitter 50 --bind 0.0.0.0:$PORT
+#  - SYNC_CLIENT_TRANSCRIBE=0: every voiceover is transcribed SERVER-side
+#    through the groq -> local -> openai chain, so timeline uploads and
+#    Generate beats always use the same engine (Groq first). Set to 1 in
+#    the platform dashboard to re-enable the browser's on-device Whisper.
+web: SYNC_CLIENT_TRANSCRIBE=0 MALLOC_ARENA_MAX=2 gunicorn app:app --workers 1 --threads 4 --timeout 300 --max-requests 200 --max-requests-jitter 50 --bind 0.0.0.0:$PORT
