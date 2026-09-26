@@ -455,10 +455,13 @@ CLIENT_TRANSCRIBE_MAX_TEXT = 400
 
 def client_transcribe_enabled() -> bool:
     """SYNC_CLIENT_TRANSCRIBE env toggle: may the browser's transcript be
-    adopted instead of running server-side Whisper? Enabled by default;
-    set SYNC_CLIENT_TRANSCRIBE=0 to force every job through the server."""
-    return os.getenv("SYNC_CLIENT_TRANSCRIBE", "1").strip().lower() not in (
-        "0", "false", "off", "no",
+    adopted instead of running server-side transcription? Disabled by
+    default so every voiceover goes through the server chain
+    (groq -> local -> openai) on every deployment; set
+    SYNC_CLIENT_TRANSCRIBE=1 to let a WebGPU-capable browser transcribe
+    on-device instead. Anything that is not an explicit opt-in is off."""
+    return os.getenv("SYNC_CLIENT_TRANSCRIBE", "0").strip().lower() in (
+        "1", "true", "on", "yes",
     )
 
 

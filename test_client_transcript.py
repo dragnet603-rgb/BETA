@@ -13,21 +13,24 @@ import sync_pipeline
 
 
 class TestClientTranscribeEnabled(unittest.TestCase):
-    """SYNC_CLIENT_TRANSCRIBE env toggle (server can disable the fast path)."""
+    """SYNC_CLIENT_TRANSCRIBE env toggle: server-side transcription is the
+    default; on-device adoption needs an explicit SYNC_CLIENT_TRANSCRIBE=1."""
 
-    def test_enabled_by_default(self):
+    def test_disabled_by_default(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SYNC_CLIENT_TRANSCRIBE", None)
-            self.assertTrue(sync_pipeline.client_transcribe_enabled())
+            self.assertFalse(sync_pipeline.client_transcribe_enabled())
 
     def test_disabled_values(self):
-        for val in ("0", "false", "OFF", " no "):
+        # Anything that is not an explicit opt-in stays off - including an
+        # empty value and garbage a dashboard might inject.
+        for val in ("0", "false", "OFF", " no ", "", "banana"):
             with self.subTest(val=val), mock.patch.dict(
                     os.environ, {"SYNC_CLIENT_TRANSCRIBE": val}):
                 self.assertFalse(sync_pipeline.client_transcribe_enabled())
 
     def test_enabled_values(self):
-        for val in ("1", "true", "yes", ""):
+        for val in ("1", "true", "TRUE", "yes", "on"):
             with self.subTest(val=val), mock.patch.dict(
                     os.environ, {"SYNC_CLIENT_TRANSCRIBE": val}):
                 self.assertTrue(sync_pipeline.client_transcribe_enabled())
