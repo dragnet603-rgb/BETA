@@ -20,6 +20,7 @@
 
 import os
 import time
+from urllib.parse import urlencode
 
 import requests
 from flask import (
@@ -74,11 +75,17 @@ def _posthog_capture(event, distinct_id, properties=None):
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 AUTH_ENABLED = bool(FIREBASE_PROJECT_ID)
 
-# LOGIN IS OPEN: every visitor can use the app without signing in (a
-# guest session is handed out automatically in require_login()), and
-# any visitor may also sign in (Google or email+password) to get a
-# persistent, personalized session. The /admin stats page stays
-# private: it is gated by stats.is_admin() (ADMIN_EMAIL), not here.
+# LOGIN IS REQUIRED: every visitor must sign in (Google or
+# email+password) before using the app. require_login() bounces anonymous
+# visitors to /login?next=...  for page loads, or answers 401 JSON for
+# fetch/XHR/API calls; a legacy anonymous "guest" session no longer
+# counts as signed in. When FIREBASE_PROJECT_ID is unset (local dev) the
+# guard stays off and a guest uid is still stamped on first visit so
+# stats keep logging. The /admin stats page stays additionally private:
+# it is gated by stats.is_admin() (ADMIN_EMAIL), not here.
+#
+# Media under /static stays public: it is referenced by <video>/<img>
+# tags and could otherwise not load on the sign-in page or elsewhere.
 
 # Routes reachable without a session. /static is also exempt
 # (Flask serves it directly), which keeps JS/CSS/images public;
@@ -148,35 +155,87 @@ def _is_public(path: str) -> bool:
     return False
 
 
+def _safe_next(raw):
+    """Return a validated relative target path, or None.
+
+    Guards the ``next`` query param (and login redirect targets) against
+    open redirects: only same-site absolute paths (``/…``) are accepted,
+    never protocol-relative URLs (``//evil``) or backslash tricks.
+    """
+    if not raw:
+        return None
+    nxt = raw.strip().replace("\\", "/")
+    if not nxt.startswith("/") or nxt.startswith("//"):
+        return None
+    return nxt
+
+
+def _wants_json():
+    """True when the current request looks like fetch/XHR/API, not a page load."""
+    if request.path.startswith("/api/"):
+        return True
+    if request.headers.get("X-Requested-With", "").lower() == "xmlhttprequest":
+        return True
+    if request.method != "GET":
+        return True
+    dest = request.headers.get("Sec-Fetch-Dest", "")
+    if dest and dest not in ("document", "iframe"):
+        return True
+    accept = request.headers.get("Accept", "")
+    if not accept.strip():
+        # No Accept header at all (Flask test client, curl, direct visit):
+        # treat as a page navigation so the gate answers a 302 to /login.
+        # Real fetch() calls always send `Accept: */*` at minimum.
+        return False
+    if "text/html" not in accept and ("application/json" in accept or "*/*" not in accept):
+        return True
+    return False
+
+
 @auth_bp.before_app_request
 def require_login():
-    """Login gate DISABLED: the app is open to everyone.
+    """Login gate: bounce anonymous visitors before any app code runs.
 
-    Every visitor automatically gets a guest session so stats logging
-    still works (guest events are grouped under the "guest" uid).
-    Public paths (/login, /api/auth/session, /logout, /healthz, /static)
-    are skipped: stamping a guest uid on /login made login_page() treat
-    the visitor as already signed in and bounce them back to the app,
-    so the sign-in form was unreachable. Anyone may sign in (Google or
-    email+password) for a persistent session; /admin stays private via
-    stats.is_admin() (ADMIN_EMAIL).
+    Every visitor without a *real* (Firebase) uid is sent to
+    /login?next=<original page> for page loads, or gets a 401 JSON body
+    for fetch/XHR/API calls (the client then redirects, also with next=).
+    The legacy anonymous "guest" uid no longer counts as signed in, so
+    old guest cookies are bounced too. When FIREBASE_PROJECT_ID is unset
+    (local dev) the guard stays off: a guest uid is still stamped on
+    first visit so stats keep logging, exactly as before.
     """
-    if not session.get("uid") and not _is_public(request.path):
-        session["uid"] = "guest"
-        session.setdefault("email", "")
-        session.permanent = True
-    return None
+    if _is_public(request.path):
+        return None
+    if not AUTH_ENABLED:
+        if not session.get("uid"):
+            session["uid"] = "guest"
+            session.setdefault("email", "")
+            session.permanent = True
+        return None
+    if session.get("uid") == "guest":
+        session.pop("uid", None)
+        session.pop("email", None)
+    if session.get("uid"):
+        return None
+    if _wants_json():
+        return jsonify(error="unauthorized", login_url=url_for("auth.login_page")), 401
+    target = request.full_path if request.query_string else request.path
+    nxt = _safe_next(target) or "/"
+    login_url = url_for("auth.login_page") + "?" + urlencode({"next": nxt})
+    return redirect(login_url)
 
 
 @auth_bp.route("/login")
 def login_page():
-    # "guest" is the anonymous uid require_login() hands out on app
-    # pages; only a real (Firebase) uid means the visitor is signed in.
-    # Showing the form to guests lets anyone who signed out - or who
-    # was auto-guested while browsing - reach the sign-in page.
+    # "guest" is the legacy anonymous uid; only a real (Firebase) uid
+    # means the visitor is signed in. Showing the form to guests lets
+    # anyone who signed out - or who holds a stale guest cookie - reach
+    # the sign-in page. A signed-in visitor is bounced to the validated
+    # ?next= target (or /) so the gate returns them where they started.
     uid = session.get("uid")
     if uid and uid != "guest":
-        return redirect(url_for("index"))
+        nxt = _safe_next(request.args.get("next", ""))
+        return redirect(nxt or url_for("index"))
     return render_template_login()
 
 
@@ -253,8 +312,14 @@ def logout():
 @auth_bp.get("/api/me")
 def me():
     import stats
+    uid = session.get("uid")
+    if not uid or uid == "guest":
+        # Defense in depth: require_login() already blocks anonymous
+        # callers, but answer 401 here too so a signed-out / legacy-guest
+        # cookie can never look like a signed-in user to the client.
+        return jsonify(error="unauthorized", login_url=url_for("auth.login_page")), 401
     return jsonify(
-        uid=session.get("uid"),
+        uid=uid,
         email=session.get("email", ""),
         name=session.get("name", ""),
         is_admin=stats.is_admin(session.get("email", "")),

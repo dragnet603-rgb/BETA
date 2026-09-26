@@ -72,6 +72,18 @@ function showStatus(msg) {
   if (el) el.textContent = msg;
 }
 
+// ?next= target the login gate bounced the visitor from. Validated
+// same-site path only (must start with / but not //, no backslashes)
+// so a crafted link can never open-redirect off-site after sign-in.
+function validatedNext() {
+  try {
+    const raw = new URLSearchParams(window.location.search).get("next") || "";
+    const nxt = raw.trim().replace(/\\/g, "/");
+    if (nxt.startsWith("/") && !nxt.startsWith("//")) return nxt;
+  } catch (_) {}
+  return null;
+}
+
 async function sessionSignIn(idToken, meta = {}) {
   const res = await fetch("/api/auth/session", {
     method: "POST",
@@ -93,7 +105,9 @@ async function sessionSignIn(idToken, meta = {}) {
   // exports are counted per real user, not per anonymous visit.
   // The redirect waits for PostHog to confirm delivery (with a
   // fallback timeout) - otherwise navigation cancels the event.
-  const go = () => { window.location.href = "/"; };
+  // After sign-in/up the user returns to the ?next= page the login
+  // gate bounced them from (validated same-site path only), or /.
+  const go = () => { window.location.href = validatedNext() || "/"; };
   try {
     const me = await (await fetch("/api/me")).json();
     if (me && me.uid && window.posthog) {
@@ -278,8 +292,11 @@ function initAppPage() {
   fetch("/api/me")
     .then((res) => {
       if (res.status === 401) {
-        // Not signed in (or session expired): go to the login page.
-        window.location.href = "/login";
+        // Not signed in (or session expired): go to the login page,
+        // with next= so the user returns here after signing in.
+        const here = window.location.pathname + window.location.search;
+        const nxt = here && here !== "/login" ? here : "/";
+        window.location.href = "/login?next=" + encodeURIComponent(nxt);
         return null;
       }
       if (!res.ok) {
