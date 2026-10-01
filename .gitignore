@@ -29,3 +29,7 @@ srv_out.txt
 tests_out.txt
 verify_cuts.py
 verify_render.py
+
+# Image stress-test artifacts (fixtures + script)
+.stress_cache/
+stress_images.py

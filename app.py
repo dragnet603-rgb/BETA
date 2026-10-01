@@ -1017,15 +1017,11 @@ def sync_upload():
         shutil.rmtree(folder, ignore_errors=True)
         return jsonify({"error": f"Could not store upload: {exc}"}), 500
 
-    # Tiny filmstrip copies so the sync timeline paints thumbnails
-    # instead of the full-size images (sync_pipeline.make_thumbnail).
-    # Best effort: a thumbnail must never be able to fail an upload.
-    for name in saved:
-        try:
-            sync_pipeline.make_thumbnail(folder, name)
-        except Exception:  # noqa: BLE001
-            pass
-
+    # Thumbnails are LAZY now (see ensure_thumbnails, topped up from the
+    # status route): building them inline held ~50-85ms/image inside this
+    # request (~40s on a 500-image job on a 512MB box). The editor opens
+    # instantly and tiles sharpen as polls catch up; the client falls back
+    # to full images for tiles not built yet (thumbnail_names -> None).
     has_audio = bool(audio_name)
     # The same picture uploaded twice cannot cut to itself, so the video
     # silently holds that image across those beats and looks out of sync.
@@ -1105,13 +1101,8 @@ def sync_add_images(job_id):
             (folder / name).unlink(missing_ok=True)
         return jsonify({"error": f"Could not store upload: {exc}"}), 500
 
-    # Same tiny filmstrip copies as the initial upload.
-    for name in saved:
-        try:
-            sync_pipeline.make_thumbnail(folder, name)
-        except Exception:  # noqa: BLE001
-            pass
-
+    # Same lazy thumbnails as the initial upload: the status poll tops
+    # them up (see below), never this request.
     manifest["images"] = existing + saved
     # Fresh duplicates can appear when the same picture is uploaded again
     # later; keep the warning in step with the stored files.
@@ -1316,6 +1307,14 @@ def sync_status(job_id):
     if not manifest:
         return jsonify({"error": "Unknown job."}), 404
     manifest = _watchdog_client_transcribe(job_id, manifest)
+    # Lazy filmstrip catch-up: build a few missing thumbnails per poll so a
+    # big upload never pays Pillow inline. Capped + lock-guarded (one job
+    # builds at a time); the payload below re-reads names so fresh tiles
+    # appear in this same response.
+    try:
+        sync_pipeline.ensure_thumbnails(job_id)
+    except Exception:  # noqa: BLE001 - thumbnails never break status
+        pass
     return jsonify(_sync_status_payload(job_id, manifest))
 
 

@@ -801,12 +801,26 @@ def find_duplicate_images(folder, names):
     probe reported "missing cut" for those three beats.
     """
     groups = {}
+    sizes = {}
     for name in names or []:
         try:
-            digest = hashlib.sha256((folder / name).read_bytes()).hexdigest()
+            # Size pre-filter: files with a unique byte count can never be
+            # byte-identical, so only stat (no read) until a size collides.
+            # The common case (all-distinct photos) becomes N stats + 0 reads
+            # instead of N full-file sha256 reads.
+            size = (folder / name).stat().st_size
         except OSError:
             continue          # unreadable file must never fail an upload
-        groups.setdefault(digest, []).append(name)
+        sizes.setdefault(size, []).append(name)
+    for same_size in sizes.values():
+        if len(same_size) < 2:
+            continue
+        for name in same_size:
+            try:
+                digest = hashlib.sha256((folder / name).read_bytes()).hexdigest()
+            except OSError:
+                continue
+            groups.setdefault(digest, []).append(name)
     return [g for g in groups.values() if len(g) > 1]
 
 
@@ -1098,7 +1112,7 @@ def _shrink_for_render(folder: Path, image_name: str) -> Path:
 
 
 THUMB_LONG_EDGE = 480
-THUMB_QUALITY = 78
+THUMB_QUALITY = 72
 
 
 def make_thumbnail(folder: Path, image_name: str):
@@ -1107,9 +1121,10 @@ def make_thumbnail(folder: Path, image_name: str):
     The sync timeline paints every uploaded picture as a small filmstrip
     tile, so it needs a tiny copy - not the 1920px original (a 20-image
     job was pulling ~10MB per page load just to draw thumbnails, through
-    a CDN that could not cache them). Generated once at upload time
-    (~20-40ms) and reused on every later load. Never raises: a missing
-    thumbnail simply means the client keeps using the full image.
+    a CDN that could not cache them). Generated lazily (see
+    ensure_thumbnails, called from the status route) and reused on every
+    later load. Never raises: a missing thumbnail simply means the client
+    keeps using the full image.
     """
     src = folder / image_name
     if not src.exists():
@@ -1124,21 +1139,68 @@ def make_thumbnail(folder: Path, image_name: str):
     if out.exists():
         return name
     try:
+        # Image.open is lazy: only the header is read here, pixels decode
+        # during resize. draft() hints the decoder toward the target size
+        # (fewer source pixels for large photos), and BILINEAR is ~2x
+        # faster than LANCZOS at these sizes with no visible difference on
+        # a 480px filmstrip tile.
         with Image.open(src) as im:
             width, height = im.size
             long_edge = max(width, height)
             if long_edge <= THUMB_LONG_EDGE:
                 return None       # already tiny - serve the original
             scale = THUMB_LONG_EDGE / long_edge
-            thumb = im.convert("RGB").resize(
-                (max(1, round(width * scale)), max(1, round(height * scale))),
-                Image.LANCZOS,
-            )
+            target = (max(1, round(width * scale)),
+                      max(1, round(height * scale)))
+            try:
+                im.draft("RGB", target)
+            except Exception:  # noqa: BLE001 - draft is best-effort
+                pass
+            thumb = im.convert("RGB").resize(target, Image.BILINEAR)
         thumb.save(out, "JPEG", quality=THUMB_QUALITY)
         thumb.close()
     except Exception:  # noqa: BLE001 - a thumbnail is never load-bearing
         return None
     return name
+
+
+# Lazily-created thumbnails: the upload route NO LONGER builds them inline
+# (sequential Pillow cost ~50-85ms/image, i.e. ~40s on a 500-image job held
+# inside the request on a 512MB box). Instead the status route tops them up
+# a few at a time per poll, so the editor opens instantly and tiles sharpen
+# progressively. Safe under gunicorn --threads: one job builds at a time,
+# re-entrant (make_thumbnail skips existing files), capped per call so a
+# status poll never blocks.
+_THUMB_LOCK = threading.Lock()
+THUMB_CATCHUP_PER_STATUS = 8
+
+
+def ensure_thumbnails(job_id: str, limit: int = THUMB_CATCHUP_PER_STATUS) -> int:
+    """Build up to `limit` missing thumbnails for a job; returns count made."""
+    manifest = load_manifest(job_id)
+    if not manifest:
+        return 0
+    names = manifest.get("images") or []
+    if not names:
+        return 0
+    folder = job_dir(job_id)
+    todo = [n for n in names
+            if not (folder / f"{Path(n).stem}_t.jpg").exists()]
+    if not todo:
+        return 0
+    if not _THUMB_LOCK.acquire(blocking=False):
+        return 0  # another poll is already building; skip, don't queue
+    try:
+        made = 0
+        for name in todo[: max(1, limit)]:
+            try:
+                if make_thumbnail(folder, name):
+                    made += 1
+            except Exception:  # noqa: BLE001 - best effort per tile
+                pass
+        return made
+    finally:
+        _THUMB_LOCK.release()
 
 
 def thumbnail_names(folder: Path, names):
