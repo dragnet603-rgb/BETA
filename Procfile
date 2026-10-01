@@ -5,7 +5,10 @@
 #  - 4 threads: enough concurrency for uploads/API without 8 simultaneous
 #    request stacks.
 #  - max-requests recycles the worker periodically so slow leaks can't
-#    accumulate on a long-running small box.
+#    accumulate on a long-running small box. Sized for the external
+#    keep-alive pinger (KEEPALIVE.md, 1 req / 5 min = ~288/day): 2000 keeps
+#    recycling to roughly weekly on pinger traffic alone instead of daily,
+#    so the pinger keeps the worker warm instead of churning it.
 #  - MALLOC_ARENA_MAX=2 curbs glibc heap fragmentation under threads.
 #  - SYNC_CLIENT_TRANSCRIBE: on-device (browser) transcription is OFF by
 #    default in the code; every voiceover goes SERVER-side through the
@@ -15,4 +18,4 @@
 #    the dashboard ONLY if this start command is replaced (some hosts
 #    ignore the Procfile) - and even then the code default keeps the
 #    browser out unless you explicitly opt in.
-web: SYNC_CLIENT_TRANSCRIBE=0 MALLOC_ARENA_MAX=2 gunicorn app:app --workers 1 --threads 4 --timeout 300 --max-requests 200 --max-requests-jitter 50 --bind 0.0.0.0:$PORT
+web: SYNC_CLIENT_TRANSCRIBE=0 MALLOC_ARENA_MAX=2 gunicorn app:app --workers 1 --threads 4 --timeout 300 --max-requests 2000 --max-requests-jitter 200 --bind 0.0.0.0:$PORT
