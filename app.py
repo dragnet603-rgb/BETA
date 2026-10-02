@@ -200,6 +200,13 @@ def static_v(filename):
     return url_for("static", filename=filename, v=version)
 
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
+# Sync-job image limits: a job can hold MAX_SYNC_IMAGES pictures, but one
+# POST carries at most MAX_SYNC_IMAGES_PER_REQUEST so a single request
+# can't hold a gunicorn thread forever. Big jobs arrive as 100 + top-up
+# (the editor's add-images path). Renders chunk in RENDER_CHUNK_SIZE
+# pieces (see sync_pipeline), so a 200-image job is 7 small FFmpeg runs.
+MAX_SYNC_IMAGES = 200
+MAX_SYNC_IMAGES_PER_REQUEST = 100
 # Sync-job uploads: images for the slideshow + one voiceover audio track.
 SYNC_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif", "bmp"}
 SYNC_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "aac", "ogg", "flac", "webm"}
@@ -980,8 +987,9 @@ def sync_upload():
 
     if not images and not (audio and audio.filename):
         return jsonify({"error": "No images or voiceover selected."}), 400
-    if len(images) > 100:
-        return jsonify({"error": "Too many images (max 100)."}), 400
+    if len(images) > MAX_SYNC_IMAGES_PER_REQUEST:
+        return jsonify({"error": "Too many images in one request "
+                                 f"(max {MAX_SYNC_IMAGES_PER_REQUEST})."}), 400
 
     bad = [
         f.filename for f in images
@@ -1067,8 +1075,9 @@ def sync_add_images(job_id):
     images = [f for f in request.files.getlist("images") if f and f.filename]
     if not images:
         return jsonify({"error": "No images selected."}), 400
-    if len(images) > 100:
-        return jsonify({"error": "Too many images at once (max 100)."}), 400
+    if len(images) > MAX_SYNC_IMAGES_PER_REQUEST:
+        return jsonify({"error": "Too many images at once "
+                                 f"(max {MAX_SYNC_IMAGES_PER_REQUEST})."}), 400
 
     bad = [
         f.filename for f in images
@@ -1078,8 +1087,8 @@ def sync_add_images(job_id):
         return jsonify({"error": f"Unsupported image type: {', '.join(bad[:3])}"}), 400
 
     existing = manifest.get("images") or []
-    if len(existing) + len(images) > 100:
-        return jsonify({"error": "Too many images in this job (max 100)."}), 400
+    if len(existing) + len(images) > MAX_SYNC_IMAGES:
+        return jsonify({"error": f"Too many images in this job (max {MAX_SYNC_IMAGES})."}), 400
 
     # Continue the img_NNN numbering from the highest existing index.
     start = 0
@@ -4172,8 +4181,11 @@ def _run_chunked_sync_export(export_job_id, sync_job_id, output_filename,
     started_at = time.monotonic()
     try:
         try:
+            # output= is resolved ABSOLUTELY here, before the join runs
+            # with cwd=tmpdir (see build_chunk_commands).
             chunk_cmds, join_cmd, total = sync_pipeline.build_chunk_commands(
-                sync_job_id, tmpdir)
+                sync_job_id, tmpdir,
+                output=OUTPUT_FOLDER / output_filename)
         except (RuntimeError, FileNotFoundError) as exc:
             _update_export_job(export_job_id, status="error", error=str(exc))
             return
@@ -4197,9 +4209,9 @@ def _run_chunked_sync_export(export_job_id, sync_job_id, output_filename,
             done_base += chunk_dur
         # Join (+ mux voiceover once) straight to the final output path.
         # The join reads parts.txt by basename, so it runs with cwd=tmpdir;
-        # the final MP4 still lands at its absolute output path.
-        final_path = OUTPUT_FOLDER / output_filename
-        join_cmd = list(join_cmd) + [str(final_path)]
+        # build_chunk_commands already resolved the output path absolutely,
+        # so the MP4 still lands in static/outputs (a relative path would
+        # be created inside tmpdir instead).
         _run_ffmpeg_export_in(join_cmd, tmpdir, export_job_id,
                               output_filename, expected_duration=total)
         try:

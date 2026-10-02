@@ -1599,13 +1599,17 @@ def needs_chunked_render(job_id: str) -> bool:
 
 
 def build_chunk_commands(job_id: str, tmpdir,
-                         chunk_size: int = RENDER_CHUNK_SIZE):
+                         chunk_size: int = RENDER_CHUNK_SIZE,
+                         output=None):
     """Split a job into per-chunk renders + one stream-copy join.
 
     Returns (chunk_cmds, join_cmd, total_seconds) where chunk_cmds is a
     list of (command, chunk_seconds, part_path). The join muxes the parts
     (+ voiceover, if any) into the final MP4 without re-encoding video.
-    The join MUST run with cwd=tmpdir (parts.txt holds basenames).
+    The join MUST run with cwd=tmpdir (parts.txt holds basenames), so
+    everything else it touches is resolved ABSOLUTELY here: the voiceover
+    input, and - when output= is passed - the final MP4 path (a relative
+    output would be created inside tmpdir instead of the output folder).
     Raises the same errors as build_render_command for invalid jobs.
     """
     plan, audio_path, total = _render_plan(job_id)
@@ -1632,9 +1636,10 @@ def build_chunk_commands(job_id: str, tmpdir,
         encoding="utf-8")
 
     if audio_path:
+        # Absolute: the join's cwd=tmpdir would hide the relative job path.
         join = ["ffmpeg", "-y", "-nostdin",
                 "-f", "concat", "-safe", "0", "-i", "parts.txt",
-                "-i", str(audio_path),
+                "-i", str(Path(audio_path).resolve()),
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                 "-shortest", "-movflags", "+faststart",
                 "-progress", "pipe:1", "-nostats"]
@@ -1643,5 +1648,9 @@ def build_chunk_commands(job_id: str, tmpdir,
                 "-f", "concat", "-safe", "0", "-i", "parts.txt",
                 "-c", "copy", "-movflags", "+faststart",
                 "-progress", "pipe:1", "-nostats"]
+    if output is not None:
+        # Same cwd trap for the OUTPUT side: resolve before the join runs
+        # inside tmpdir, or ffmpeg creates the MP4 under tmpdir.
+        join.append(str(Path(output).resolve()))
     return chunk_cmds, join, total
 
