@@ -1328,19 +1328,12 @@ def _legacy_graph():
     )
 
 
-def build_render_command(job_id: str, output_path: Path):
-    """
-    Build the FFmpeg command that renders a sync job as a 16:9 MP4.
+def _render_plan(job_id: str):
+    """Shared plan resolution for single-graph and chunked renders.
 
-    Two modes:
-      * synced    - speech segments exist: each image is shown for its
-                    segment's screen time and the voiceover is muxed in.
-      * slideshow - no segments: the timeline's own order and per-image
-                    durations are rendered silent, so the tool works with
-                    or without a transcription.
-
-    Returns (command, total_duration_seconds). Raises RuntimeError with a
-    user-readable message when the job cannot be rendered yet.
+    Returns (plan, audio_path_or_None, total_seconds). Raises the same
+    user-readable RuntimeError/FileNotFoundError as build_render_command
+    for unknown jobs, unfinished transcription, or missing files.
     """
     manifest = load_manifest(job_id)
     if not manifest:
@@ -1357,10 +1350,8 @@ def build_render_command(job_id: str, output_path: Path):
 
     if segments:
         # Segments exist only when transcription finished (the worker)
-        # or when sync_update derived them from the clip layout (a
-        # script apply on a job whose transcription failed still renders
-        # with its typed timing) - both are renderable; mid-transcription
-        # is not.
+        # or when sync_update derived them from the clip layout - both are
+        # renderable; mid-transcription is not.
         if manifest.get("status") in ("transcribing", "processing"):
             raise RuntimeError("Transcription is not finished yet.")
         if not manifest.get("matched"):
@@ -1376,9 +1367,8 @@ def build_render_command(job_id: str, output_path: Path):
     else:
         # A job with a voiceover but no segments yet must NOT fall through
         # to the silent slideshow: that used to render images at 3s each
-        # with the audio dropped (-an) whenever the user clicked Build
-        # while Whisper was still transcribing. The downloaded file then
-        # had no audio and no sync. Guard it here and tell the user why.
+        # with the audio dropped whenever the user clicked Build while
+        # Whisper was still transcribing.
         if manifest.get("audio"):
             status = manifest.get("status")
             if status in ("transcribing", "processing"):
@@ -1392,21 +1382,37 @@ def build_render_command(job_id: str, output_path: Path):
                     + (manifest.get("error") or "unknown error")
                     + " - fix the voiceover and re-upload it."
                 )
-            # status == ready but no segments (e.g. corrupt audio produced
-            # nothing at all): same guard, different wording.
             raise RuntimeError(
                 "No speech could be synced from this voiceover - "
                 "check the audio file and re-upload it."
             )
         plan = _clip_plan(clips, images)
 
-
     if not plan:
         raise RuntimeError("Nothing to render.")
+    return plan, audio_path, sum(d for _, d in plan)
+
+
+def build_render_command(job_id: str, output_path: Path):
+    """
+    Build the FFmpeg command that renders a sync job as a 16:9 MP4.
+
+    Two modes:
+      * synced    - speech segments exist: each image is shown for its
+                    segment's screen time and the voiceover is muxed in.
+      * slideshow - no segments: the timeline's own order and per-image
+                    durations are rendered silent, so the tool works with
+                    or without a transcription.
+
+    Returns (command, total_duration_seconds). Raises RuntimeError with a
+    user-readable message when the job cannot be rendered yet.
+    """
+    plan, audio_path, total = _render_plan(job_id)
+    folder = job_dir(job_id)
+    images = load_manifest(job_id).get("images") or []
 
     command = ["ffmpeg", "-y", "-nostdin"]
     filters = []
-    total_weight = 0.0
 
     # Frame-grid quantization (see _frame_counts): each segment's screen
     # time is an exact INTEGER number of frames taken from the CUMULATIVE
@@ -1420,7 +1426,6 @@ def build_render_command(job_id: str, output_path: Path):
         img_path = _shrink_for_render(folder, images[idx])
         if not img_path.exists():
             raise RuntimeError(f"Image file missing: {images[idx]}")
-        total_weight += dur
 
         command += [
             # Bound this input's read-ahead to a single packet. concat
@@ -1477,8 +1482,6 @@ def build_render_command(job_id: str, output_path: Path):
 
     # True length of the render: the sum of the per-image screen times,
     # which now includes the pauses (used for progress reporting).
-    total = total_weight
-
     command += [
         "-filter_complex", ";".join(filters),
         "-filter_complex_threads", str(_render_filter_threads()),
@@ -1519,4 +1522,126 @@ def build_render_command(job_id: str, output_path: Path):
         str(output_path),
     ]
     return command, total
+
+
+# Max inputs per FFmpeg process. Memory scales with input count (~490MB at
+# 30 inputs on a 512MB box), so big jobs render in silent chunks of this
+# size and join with stream-copy concat. 30 is the measured-safe value.
+RENDER_CHUNK_SIZE = 30
+
+
+def _chunk_graph(plan_slice, folder, images, output_path):
+    """One self-contained SILENT chunk render (same filters, no audio).
+
+    Frame counts derive from the chunk-local cumulative timeline (see
+    _frame_counts), so chunk boundaries sit on exact frames and the join
+    is seamless. The voiceover is muxed once at join time, not per chunk.
+    """
+    render_fps = _render_fps()
+    frame_counts = _frame_counts([d for _, d in plan_slice], render_fps)
+    legacy = _legacy_graph()
+
+    command = ["ffmpeg", "-y", "-nostdin"]
+    filters = []
+    for i, (idx, _dur) in enumerate(plan_slice):
+        img_path = _shrink_for_render(folder, images[idx])
+        if not img_path.exists():
+            raise RuntimeError(f"Image file missing: {images[idx]}")
+        command += ["-thread_queue_size", "1", "-framerate", str(render_fps)]
+        if legacy:
+            command += ["-loop", "1", "-t",
+                        f"{frame_counts[i] / render_fps:.6f}"]
+        command += ["-i", str(img_path)]
+        base = (
+            f"[{i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+            f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,format=yuv420p"
+        )
+        if legacy:
+            filters.append(f"{base}[v{i}]")
+        else:
+            filters.append(
+                f"{base},loop=loop=-1:size=1:start=0,"
+                f"trim=end_frame={frame_counts[i]},"
+                f"setpts=PTS-STARTPTS[v{i}]"
+            )
+    labels = "".join(f"[v{i}]" for i in range(len(plan_slice)))
+    filters.append(
+        f"{labels}concat=n={len(plan_slice)}:v=1:a=0,fps={render_fps}[vout]"
+    )
+    command += [
+        "-filter_complex", ";".join(filters),
+        "-filter_complex_threads", str(_render_filter_threads()),
+        "-map", "[vout]", "-an",
+        "-c:v", "libx264",
+        "-preset", os.getenv("SYNC_X264_PRESET", "ultrafast"),
+        "-tune", "stillimage", "-crf", "21",
+        "-pix_fmt", "yuv420p",
+        "-threads", str(_render_threads()),
+        "-x264-params", "rc-lookahead=0:sync-lookahead=0",
+        # +faststart moves moov to the front (streaming) and keeps chunk
+        # success/failure unambiguous: only a finished close writes moov,
+        # so a killed part never probes clean (see _part_ok in stress).
+        "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats",
+        str(output_path),
+    ]
+    return command
+
+
+def needs_chunked_render(job_id: str) -> bool:
+    """True when a job's plan exceeds one FFmpeg process's safe size."""
+    try:
+        plan, _, _ = _render_plan(job_id)
+    except (RuntimeError, FileNotFoundError):
+        return False  # validation errors surface from the normal path
+    return len(plan) > RENDER_CHUNK_SIZE
+
+
+def build_chunk_commands(job_id: str, tmpdir,
+                         chunk_size: int = RENDER_CHUNK_SIZE):
+    """Split a job into per-chunk renders + one stream-copy join.
+
+    Returns (chunk_cmds, join_cmd, total_seconds) where chunk_cmds is a
+    list of (command, chunk_seconds, part_path). The join muxes the parts
+    (+ voiceover, if any) into the final MP4 without re-encoding video.
+    The join MUST run with cwd=tmpdir (parts.txt holds basenames).
+    Raises the same errors as build_render_command for invalid jobs.
+    """
+    plan, audio_path, total = _render_plan(job_id)
+    folder = job_dir(job_id)
+    images = load_manifest(job_id).get("images") or []
+    tmpdir = Path(tmpdir)
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    step = max(1, int(chunk_size))
+
+    chunk_cmds = []
+    for c, start in enumerate(range(0, len(plan), step)):
+        part = tmpdir / f"part_{c:03d}.mp4"
+        piece = plan[start:start + step]
+        cmd = _chunk_graph(piece, folder, images, part)
+        chunk_cmds.append((cmd, sum(d for _, d in piece), part))
+
+    list_file = tmpdir / "parts.txt"
+    # Basenames only: the join runs with cwd=tmpdir, so the list stays
+    # valid no matter where the job folder lives (absolute Windows paths
+    # with backslashes break the concat demuxer).
+    list_file.write_text(
+        "".join(f"file '{f'part_{c:03d}.mp4'}'\n"
+                for c in range(len(chunk_cmds))),
+        encoding="utf-8")
+
+    if audio_path:
+        join = ["ffmpeg", "-y", "-nostdin",
+                "-f", "concat", "-safe", "0", "-i", "parts.txt",
+                "-i", str(audio_path),
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart",
+                "-progress", "pipe:1", "-nostats"]
+    else:
+        join = ["ffmpeg", "-y", "-nostdin",
+                "-f", "concat", "-safe", "0", "-i", "parts.txt",
+                "-c", "copy", "-movflags", "+faststart",
+                "-progress", "pipe:1", "-nostats"]
+    return chunk_cmds, join, total
 

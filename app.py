@@ -1740,10 +1740,17 @@ def sync_render(job_id):
 
     def _sync_worker():
         try:
-            _run_ffmpeg_export(
-                export_job_id, command, output_filename,
-                expected_duration=total,
-            )
+            # Big jobs render in silent chunks and join (constant memory);
+            # small jobs keep the exact single-graph path as before.
+            if sync_pipeline.needs_chunked_render(job_id):
+                _run_chunked_sync_export(
+                    export_job_id, job_id, output_filename, total,
+                )
+            else:
+                _run_ffmpeg_export(
+                    export_job_id, command, output_filename,
+                    expected_duration=total,
+                )
         finally:
             _FFMPEG_SLOTS.release()
 
@@ -4152,6 +4159,171 @@ def edit_video(filename):
     })
 
 
+def _run_chunked_sync_export(export_job_id, sync_job_id, output_filename,
+                           total_duration):
+    """Render a big sync job in silent chunks, then stream-copy join.
+
+    Peak RAM stays at one small-chunk render no matter how many images the
+    job holds. Progress blends per-chunk completion with the running
+    chunk's own -progress output. Temp parts are removed afterwards (or
+    on any failure) so the small disk never fills.
+    """
+    tmpdir = Path(tempfile.mkdtemp(prefix="sync_chunks_"))
+    started_at = time.monotonic()
+    try:
+        try:
+            chunk_cmds, join_cmd, total = sync_pipeline.build_chunk_commands(
+                sync_job_id, tmpdir)
+        except (RuntimeError, FileNotFoundError) as exc:
+            _update_export_job(export_job_id, status="error", error=str(exc))
+            return
+        done_base = 0.0
+        for c, (cmd, chunk_dur, _part) in enumerate(chunk_cmds):
+            _update_export_job(
+                export_job_id,
+                progress=min(99.0, done_base / total_duration * 100.0)
+                if total_duration > 0 else 0.0)
+            # Run the chunk with progress scaled into its share of the whole.
+            _run_ffmpeg_export_scaled(
+                export_job_id, cmd, None, chunk_dur,
+                base_frac=done_base / total_duration
+                if total_duration > 0 else 0.0,
+                span_frac=chunk_dur / total_duration
+                if total_duration > 0 else 0.0)
+            job = _get_export_job(export_job_id)
+            if not job or job.get("status") == "error":
+                print(f"[Autoquence] Chunked render stopped: chunk {c} failed.")
+                return  # error already recorded by the chunk run
+            done_base += chunk_dur
+        # Join (+ mux voiceover once) straight to the final output path.
+        # The join reads parts.txt by basename, so it runs with cwd=tmpdir;
+        # the final MP4 still lands at its absolute output path.
+        final_path = OUTPUT_FOLDER / output_filename
+        join_cmd = list(join_cmd) + [str(final_path)]
+        _run_ffmpeg_export_in(join_cmd, tmpdir, export_job_id,
+                              output_filename, expected_duration=total)
+        try:
+            elapsed = time.monotonic() - started_at
+            speed = (total / elapsed) if elapsed > 0 else 0.0
+            print(f"[Autoquence] Chunked export finished: {output_filename} "
+                  f"in {elapsed:.1f}s ({speed:.2f}x realtime of "
+                  f"{total:.1f}s, {len(chunk_cmds)} chunks)")
+        except Exception:  # noqa: BLE001 - logging only
+            pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _run_ffmpeg_export_scaled(export_job_id, command, _unused, chunk_dur,
+                              base_frac=0.0, span_frac=1.0):
+    """Run one chunk, mapping its 0..100% into [base, base+span] of the job.
+
+    A failed chunk records status=error on the export job (same shape as
+    _run_ffmpeg_export) so the caller can stop the sequence.
+    """
+    stderr_file = None
+    try:
+        stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                   stderr=stderr_file, text=True)
+        timeout_s = max(60, int(os.environ.get("FFMPEG_RENDER_TIMEOUT", "900")))
+        timed_out = []
+        watchdog = threading.Timer(
+            timeout_s,
+            lambda: (timed_out.append(True),
+                     _kill_process(process)))
+        watchdog.daemon = True
+        watchdog.start()
+        for line in process.stdout:
+            line = line.strip()
+            if not line.startswith("out_time=") or chunk_dur <= 0:
+                continue
+            try:
+                h, m, s = line.split("=", 1)[1].split(":")
+                rendered = int(h) * 3600 + int(m) * 60 + float(s)
+                frac = base_frac + span_frac * min(1.0, rendered / chunk_dur)
+                _update_export_job(export_job_id,
+                                   progress=min(99.0, frac * 100.0))
+            except ValueError:
+                continue
+        watchdog.cancel()
+        process.wait()
+        stderr_file.seek(0)
+        err = stderr_file.read()[-6000:]
+        if process.returncode != 0:
+            msg = ("FFmpeg chunk timed out." if timed_out
+                   else f"FFmpeg chunk failed: {err}")
+            print("[Autoquence] Chunked render chunk failed:", msg)
+            _update_export_job(export_job_id, status="error", error=msg)
+    except FileNotFoundError:
+        _update_export_job(export_job_id, status="error",
+                           error="FFmpeg is not installed or not on PATH.")
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        _update_export_job(export_job_id, status="error", error=str(exc))
+    finally:
+        if stderr_file is not None:
+            stderr_file.close()
+
+
+def _kill_process(process):
+    try:
+        process.kill()
+    except Exception:  # noqa: BLE001 - may have just exited
+        pass
+
+
+def _run_ffmpeg_export_in(command, cwd, job_id, output_filename,
+                          expected_duration=0.0):
+    """_run_ffmpeg_export with a working directory (chunk-join parts.txt)."""
+    stderr_file = None
+    try:
+        stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        process = subprocess.Popen(command, cwd=str(cwd),
+                                   stdout=subprocess.PIPE,
+                                   stderr=stderr_file, text=True)
+        timeout_s = max(60, int(os.environ.get("FFMPEG_RENDER_TIMEOUT", "900")))
+        timed_out = []
+        watchdog = threading.Timer(timeout_s, _kill_process,
+                                   args=(process,))
+        watchdog.daemon = True
+        watchdog.start()
+        for line in process.stdout:
+            line = line.strip()
+            if not line.startswith("out_time=") or expected_duration <= 0:
+                continue
+            try:
+                h, m, s = line.split("=", 1)[1].split(":")
+                rendered = int(h) * 3600 + int(m) * 60 + float(s)
+                pct = min(99.0, rendered / expected_duration * 100.0)
+                _update_export_job(job_id, progress=pct)
+            except ValueError:
+                continue
+        watchdog.cancel()
+        process.wait()
+        stderr_file.seek(0)
+        err = stderr_file.read()[-6000:]
+        if process.returncode != 0:
+            msg = ("FFmpeg join timed out." if timed_out
+                   else f"FFmpeg join failed: {err}")
+            print("[Autoquence] Chunked join failed:", msg)
+            _update_export_job(job_id, status="error", error=msg)
+            return
+        _update_export_job(job_id, status="done", progress=100.0,
+                           output_file=output_filename)
+    except FileNotFoundError:
+        _update_export_job(job_id, status="error",
+                           error="FFmpeg is not installed or not on PATH.")
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        _update_export_job(job_id, status="error", error=str(exc))
+    finally:
+        if stderr_file is not None:
+            stderr_file.close()
+
+
 def _run_ffmpeg_export(job_id, command, output_filename, expected_duration=0.0, text_files=None):
     """
     Background FFmpeg execution with real progress reporting.
@@ -4390,13 +4562,19 @@ def export_modal(filename):
     def _modal_worker():
         _FFMPEG_SLOTS.acquire()
         try:
-            modal_ffmpeg_client.export_with_plate(
+            # render_export returns the backend that actually ran ("modal"
+            # or "local") so credit burn is auditable in the logs.
+            backend = modal_ffmpeg_client.export_with_plate(
                 str(input_path), plate_bytes, geom, str(output_path)
             )
             _update_export_job(
                 job_id, status="done", progress=100.0, output_file=output_filename
             )
             _stats.log_event("", "", "export_completed", output_filename)
+            _stats.log_event(
+                session.get("email", ""), session.get("uid", ""),
+                "export_backend", backend,
+            )
         except Exception as exc:
             import traceback
             traceback.print_exc()

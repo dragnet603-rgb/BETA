@@ -18,10 +18,18 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 MODAL_WEB_URL = os.environ.get("MODAL_WEB_URL", "").strip().rstrip("/")
+
+# Upload timeout for the Modal call (large source videos need headroom).
+# Override with MODAL_TIMEOUT_S; defaults to 15 min.
+try:
+    MODAL_TIMEOUT_S = max(60, int(os.getenv("MODAL_TIMEOUT_S", "900")))
+except (TypeError, ValueError):
+    MODAL_TIMEOUT_S = 900
 
 
 def modal_configured() -> bool:
@@ -45,7 +53,8 @@ def _post_modal_multipart(
             "plate": ("plate.png", pf, "image/png"),
         }
         data = {"geom": json.dumps(geom)}
-        resp = requests.post(MODAL_WEB_URL, files=files, data=data, timeout=900)
+        resp = requests.post(MODAL_WEB_URL, files=files, data=data,
+                             timeout=(10, MODAL_TIMEOUT_S))
     if resp.status_code != 200:
         raise RuntimeError(f"Modal render failed ({resp.status_code}): {resp.text[:500]}")
     return resp.content
@@ -65,15 +74,22 @@ def render_export(
     # Try Modal first.
     if modal_configured():
         try:
+            t0 = time.monotonic()
             data = _post_modal_multipart(src_path, plate_path, geom)
             Path(out_path).write_bytes(data)
+            dt = time.monotonic() - t0
+            print(f"[AUTOQUENCE] Export backend=modal in {dt:.1f}s "
+                  f"({len(data) / 1e6:.1f}MB): {out_path}")
             return "modal"
         except Exception as exc:  # remote path failed — fall through to local
             print(f"[AUTOQUENCE] Modal render failed, using local: {exc}")
 
     # Local fallback (modal_export.run_render: NVENC if present, else x264).
     from modal_export import run_render
+    t0 = time.monotonic()
     run_render(src_path, plate_path, out_path, geom)
+    dt = time.monotonic() - t0
+    print(f"[AUTOQUENCE] Export backend=local in {dt:.1f}s: {out_path}")
     return "local"
 
 
